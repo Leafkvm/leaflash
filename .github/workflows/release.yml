@@ -22,12 +22,6 @@ jobs:
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             archive: tar.gz
-          - target: aarch64-unknown-linux-musl
-            os: ubuntu-latest
-            archive: tar.gz
-          - target: x86_64-apple-darwin
-            os: macos-13
-            archive: tar.gz
           - target: aarch64-apple-darwin
             os: macos-latest
             archive: tar.gz
@@ -59,35 +53,6 @@ jobs:
           sudo ln -sf /usr/include/asm-generic /usr/include/x86_64-linux-musl/asm-generic
           sudo ln -sf /usr/include/x86_64-linux-gnu/asm /usr/include/x86_64-linux-musl/asm
 
-      - name: Setup musl cross toolchain (aarch64)
-        if: matrix.target == 'aarch64-unknown-linux-musl'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu musl-tools
-          # Install aarch64 musl toolchain via musl.cc release
-          curl -L https://musl.cc/aarch64-linux-musl-cross.tgz | sudo tar xz -C /opt
-          echo "/opt/aarch64-linux-musl-cross/bin" >> $GITHUB_PATH
-          mkdir -p .cargo
-          cat >> .cargo/config.toml <<'EOF'
-          [target.aarch64-unknown-linux-musl]
-          linker = "aarch64-linux-musl-gcc"
-          EOF
-          # Symlink kernel headers into the aarch64 musl sysroot
-          SYSROOT=/opt/aarch64-linux-musl-cross/aarch64-linux-musl
-          sudo apt-get install -y linux-libc-dev-arm64-cross || true
-          if [ -d /usr/aarch64-linux-gnu/include/linux ]; then
-            sudo ln -sf /usr/aarch64-linux-gnu/include/linux $SYSROOT/include/linux
-            sudo ln -sf /usr/aarch64-linux-gnu/include/asm $SYSROOT/include/asm
-            sudo ln -sf /usr/aarch64-linux-gnu/include/asm-generic $SYSROOT/include/asm-generic
-          else
-            sudo ln -sf /usr/include/linux $SYSROOT/include/linux
-            sudo ln -sf /usr/include/asm-generic $SYSROOT/include/asm-generic
-            sudo ln -sf /usr/include/asm-generic $SYSROOT/include/asm
-          fi
-          echo "CC_aarch64_unknown_linux_musl=aarch64-linux-musl-gcc" >> $GITHUB_ENV
-          echo "AR_aarch64_unknown_linux_musl=aarch64-linux-musl-ar" >> $GITHUB_ENV
-          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-musl-gcc" >> $GITHUB_ENV
-
       # ---------- macOS: libusb via Homebrew ----------
       - name: Install macOS deps
         if: runner.os == 'macOS'
@@ -108,13 +73,7 @@ jobs:
       - name: Strip (Unix)
         if: runner.os != 'Windows'
         shell: bash
-        run: |
-          BIN=target/${{ matrix.target }}/release/leaflash
-          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
-            aarch64-linux-musl-strip "$BIN" || true
-          else
-            strip "$BIN" || true
-          fi
+        run: strip "target/${{ matrix.target }}/release/leaflash" || true
 
       - name: Package
         id: pkg
