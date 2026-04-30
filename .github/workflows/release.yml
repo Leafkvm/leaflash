@@ -1,0 +1,157 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            archive: tar.gz
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            archive: tar.gz
+          - target: x86_64-apple-darwin
+            os: macos-13
+            archive: tar.gz
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            archive: tar.gz
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # ---------- Linux musl: rusb / libusb workaround ----------
+      # rusb pulls in libusb1-sys which #includes <linux/...> headers that musl-gcc
+      # can't find. Symlink the system kernel headers into the musl include path.
+      # See https://github.com/a1ien/rusb/issues/176#issuecomment-2625736139
+      - name: Setup musl cross toolchain (x86_64)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          sudo ln -sf /usr/include/linux /usr/include/x86_64-linux-musl/linux
+          sudo ln -sf /usr/include/asm-generic /usr/include/x86_64-linux-musl/asm-generic
+          sudo ln -sf /usr/include/x86_64-linux-gnu/asm /usr/include/x86_64-linux-musl/asm
+
+      - name: Setup musl cross toolchain (aarch64)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu musl-tools
+          # Install aarch64 musl toolchain via musl.cc release
+          curl -L https://musl.cc/aarch64-linux-musl-cross.tgz | sudo tar xz -C /opt
+          echo "/opt/aarch64-linux-musl-cross/bin" >> $GITHUB_PATH
+          mkdir -p .cargo
+          cat >> .cargo/config.toml <<'EOF'
+          [target.aarch64-unknown-linux-musl]
+          linker = "aarch64-linux-musl-gcc"
+          EOF
+          # Symlink kernel headers into the aarch64 musl sysroot
+          SYSROOT=/opt/aarch64-linux-musl-cross/aarch64-linux-musl
+          sudo apt-get install -y linux-libc-dev-arm64-cross || true
+          if [ -d /usr/aarch64-linux-gnu/include/linux ]; then
+            sudo ln -sf /usr/aarch64-linux-gnu/include/linux $SYSROOT/include/linux
+            sudo ln -sf /usr/aarch64-linux-gnu/include/asm $SYSROOT/include/asm
+            sudo ln -sf /usr/aarch64-linux-gnu/include/asm-generic $SYSROOT/include/asm-generic
+          else
+            sudo ln -sf /usr/include/linux $SYSROOT/include/linux
+            sudo ln -sf /usr/include/asm-generic $SYSROOT/include/asm-generic
+            sudo ln -sf /usr/include/asm-generic $SYSROOT/include/asm
+          fi
+          echo "CC_aarch64_unknown_linux_musl=aarch64-linux-musl-gcc" >> $GITHUB_ENV
+          echo "AR_aarch64_unknown_linux_musl=aarch64-linux-musl-ar" >> $GITHUB_ENV
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-musl-gcc" >> $GITHUB_ENV
+
+      # ---------- macOS: libusb via Homebrew ----------
+      - name: Install macOS deps
+        if: runner.os == 'macOS'
+        run: brew install libusb pkg-config
+
+      # ---------- Windows: vcpkg installs libusb ----------
+      - name: Install Windows deps (libusb via vcpkg)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          vcpkg install libusb:x64-windows-static-md
+          echo "LIBUSB_DIR=$VCPKG_INSTALLATION_ROOT/installed/x64-windows-static-md" >> $GITHUB_ENV
+          echo "RUSTFLAGS=-C target-feature=+crt-static" >> $GITHUB_ENV
+
+      - name: Build release
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Strip (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          BIN=target/${{ matrix.target }}/release/leaflash
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
+            aarch64-linux-musl-strip "$BIN" || true
+          else
+            strip "$BIN" || true
+          fi
+
+      - name: Package
+        id: pkg
+        shell: bash
+        run: |
+          NAME=leaflash-${GITHUB_REF_NAME}-${{ matrix.target }}
+          mkdir -p dist
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            cp target/${{ matrix.target }}/release/leaflash.exe dist/
+            cd dist && 7z a "${NAME}.zip" leaflash.exe && cd ..
+            echo "asset=dist/${NAME}.zip" >> $GITHUB_OUTPUT
+          else
+            cp target/${{ matrix.target }}/release/leaflash dist/
+            cd dist && tar czf "${NAME}.tar.gz" leaflash && cd ..
+            echo "asset=dist/${NAME}.tar.gz" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: leaflash-${{ matrix.target }}
+          path: ${{ steps.pkg.outputs.asset }}
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true

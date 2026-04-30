@@ -1,0 +1,31 @@
+[package]
+name = "leaflash"
+version = "0.0.0"
+edition = "2024"
+authors = ["Lazymio <mio@lazym.io>"]
+license = "MIT OR Apache-2.0"
+description = "Flashing and development CLI for the LeafKVM device"
+repository = "https://github.com/Leafkvm/leaflash"
+
+[[bin]]
+name = "leaflash"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.28"
+fastrand = "2"
+gptman = "1"
+indicatif = "0.17"
+ratatui = "0.29"
+ratatui-explorer = "0.2"
+rockusb = { git = "https://github.com/wtdcode/rockchiprs", branch = "dev", features = ["libusb"] }
+rockusb-cli = { git = "https://github.com/wtdcode/rockchiprs", branch = "dev", features = ["libusb"] }
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1
+opt-level = "z"
+panic = "abort"
