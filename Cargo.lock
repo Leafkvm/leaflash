@@ -690,6 +690,7 @@ dependencies = [
  "ratatui-explorer",
  "rockusb",
  "rockusb-cli",
+ "rusb",
 ]
 
 [[package]]

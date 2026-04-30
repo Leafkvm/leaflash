@@ -22,6 +22,14 @@ jobs:
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             archive: tar.gz
+            use_zig: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            archive: tar.gz
+            use_zig: true
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            archive: tar.gz
           - target: aarch64-apple-darwin
             os: macos-latest
             archive: tar.gz
@@ -30,6 +38,22 @@ jobs:
             archive: zip
     steps:
       - uses: actions/checkout@v4
+
+      - name: Bump Cargo.toml version from tag
+        shell: bash
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          # Replace the first `version = "..."` in Cargo.toml (the [package] one)
+          python3 - "$VERSION" <<'PY'
+          import re, sys
+          v = sys.argv[1]
+          with open("Cargo.toml") as f:
+              s = f.read()
+          s = re.sub(r'^version\s*=\s*"[^"]*"', f'version = "{v}"', s, count=1, flags=re.M)
+          with open("Cargo.toml", "w") as f:
+              f.write(s)
+          print(f"Set crate version to {v}")
+          PY
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -40,41 +64,36 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      # ---------- Linux musl: rusb / libusb workaround ----------
-      # rusb pulls in libusb1-sys which #includes <linux/...> headers that musl-gcc
-      # can't find. Symlink the system kernel headers into the musl include path.
-      # See https://github.com/a1ien/rusb/issues/176#issuecomment-2625736139
-      - name: Setup musl cross toolchain (x86_64)
-        if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools
-          sudo ln -sf /usr/include/linux /usr/include/x86_64-linux-musl/linux
-          sudo ln -sf /usr/include/asm-generic /usr/include/x86_64-linux-musl/asm-generic
-          sudo ln -sf /usr/include/x86_64-linux-gnu/asm /usr/include/x86_64-linux-musl/asm
+      # ---------- Linux musl via cargo-zigbuild ----------
+      # zig provides a self-contained C cross-toolchain (incl. musl libc and
+      # Linux kernel headers) for both x86_64 and aarch64 musl targets, so
+      # libusb1-sys's vendored build compiles cleanly without symlink hacks.
+      - name: Setup zig
+        if: matrix.use_zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.13.0
 
-      # ---------- macOS: libusb via Homebrew ----------
-      - name: Install macOS deps
-        if: runner.os == 'macOS'
-        run: brew install libusb pkg-config
+      - name: Install cargo-zigbuild
+        if: matrix.use_zig
+        run: cargo install --locked cargo-zigbuild
 
-      # ---------- Windows: vcpkg installs libusb ----------
-      - name: Install Windows deps (libusb via vcpkg)
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          vcpkg install libusb:x64-windows-static-md
-          echo "LIBUSB_DIR=$VCPKG_INSTALLATION_ROOT/installed/x64-windows-static-md" >> $GITHUB_ENV
-          echo "RUSTFLAGS=-C target-feature=+crt-static" >> $GITHUB_ENV
+      # ---------- Build ----------
+      - name: Build (zigbuild)
+        if: matrix.use_zig
+        run: cargo zigbuild --release --target ${{ matrix.target }}
 
-      - name: Build release
+      - name: Build (native)
+        if: '!matrix.use_zig'
         run: cargo build --release --target ${{ matrix.target }}
 
+      # ---------- Strip ----------
       - name: Strip (Unix)
         if: runner.os != 'Windows'
         shell: bash
         run: strip "target/${{ matrix.target }}/release/leaflash" || true
 
+      # ---------- Package ----------
       - name: Package
         id: pkg
         shell: bash

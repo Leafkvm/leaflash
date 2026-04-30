@@ -22,6 +22,9 @@ ratatui = "0.29"
 ratatui-explorer = "0.2"
 rockusb = { git = "https://github.com/wtdcode/rockchiprs", branch = "dev", features = ["libusb"] }
 rockusb-cli = { git = "https://github.com/wtdcode/rockchiprs", branch = "dev", features = ["libusb"] }
+# Compile libusb from source so we don't need a system libusb anywhere — keeps
+# cross-compiling (musl, both darwin slices, Windows) self-contained.
+rusb = { version = "0.9", features = ["vendored"] }
 
 [profile.release]
 strip = true
