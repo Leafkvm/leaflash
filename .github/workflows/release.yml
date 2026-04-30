@@ -21,21 +21,16 @@ jobs:
         include:
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
-            archive: tar.gz
             use_zig: true
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
-            archive: tar.gz
             use_zig: true
           - target: x86_64-apple-darwin
             os: macos-latest
-            archive: tar.gz
           - target: aarch64-apple-darwin
             os: macos-latest
-            archive: tar.gz
           - target: x86_64-pc-windows-msvc
             os: windows-latest
-            archive: zip
     steps:
       - uses: actions/checkout@v4
 
@@ -93,22 +88,20 @@ jobs:
         shell: bash
         run: strip "target/${{ matrix.target }}/release/leaflash" || true
 
-      # ---------- Package ----------
-      - name: Package
+      # ---------- Rename to per-target name (no compression) ----------
+      - name: Rename binary
         id: pkg
         shell: bash
         run: |
-          NAME=leaflash-${GITHUB_REF_NAME}-${{ matrix.target }}
           mkdir -p dist
-          if [ "${{ matrix.archive }}" = "zip" ]; then
-            cp target/${{ matrix.target }}/release/leaflash.exe dist/
-            cd dist && 7z a "${NAME}.zip" leaflash.exe && cd ..
-            echo "asset=dist/${NAME}.zip" >> $GITHUB_OUTPUT
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            ASSET=dist/leaflash-${GITHUB_REF_NAME}-${{ matrix.target }}.exe
+            cp "target/${{ matrix.target }}/release/leaflash.exe" "$ASSET"
           else
-            cp target/${{ matrix.target }}/release/leaflash dist/
-            cd dist && tar czf "${NAME}.tar.gz" leaflash && cd ..
-            echo "asset=dist/${NAME}.tar.gz" >> $GITHUB_OUTPUT
+            ASSET=dist/leaflash-${GITHUB_REF_NAME}-${{ matrix.target }}
+            cp "target/${{ matrix.target }}/release/leaflash" "$ASSET"
           fi
+          echo "asset=$ASSET" >> $GITHUB_OUTPUT
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
