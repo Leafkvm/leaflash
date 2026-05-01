@@ -21,16 +21,21 @@ jobs:
         include:
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
+            asset: leaflash-linux-amd64
             use_zig: true
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
+            asset: leaflash-linux-aarch64
             use_zig: true
           - target: x86_64-apple-darwin
             os: macos-latest
+            asset: leaflash-macos-amd64
           - target: aarch64-apple-darwin
             os: macos-latest
+            asset: leaflash-macos-aarch64
           - target: x86_64-pc-windows-msvc
             os: windows-latest
+            asset: leaflash-win-amd64.exe
     steps:
       - uses: actions/checkout@v4
 
@@ -88,17 +93,16 @@ jobs:
         shell: bash
         run: strip "target/${{ matrix.target }}/release/leaflash" || true
 
-      # ---------- Rename to per-target name (no compression) ----------
+      # ---------- Rename to friendly per-target name (no compression) ----------
       - name: Rename binary
         id: pkg
         shell: bash
         run: |
           mkdir -p dist
+          ASSET="dist/${{ matrix.asset }}"
           if [ "${{ runner.os }}" = "Windows" ]; then
-            ASSET=dist/leaflash-${GITHUB_REF_NAME}-${{ matrix.target }}.exe
             cp "target/${{ matrix.target }}/release/leaflash.exe" "$ASSET"
           else
-            ASSET=dist/leaflash-${GITHUB_REF_NAME}-${{ matrix.target }}
             cp "target/${{ matrix.target }}/release/leaflash" "$ASSET"
           fi
           echo "asset=$ASSET" >> $GITHUB_OUTPUT
@@ -106,7 +110,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: leaflash-${{ matrix.target }}
+          name: ${{ matrix.asset }}
           path: ${{ steps.pkg.outputs.asset }}
 
   release:
