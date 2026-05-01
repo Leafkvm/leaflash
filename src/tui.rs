@@ -43,6 +43,11 @@ struct App {
     flash_result: Arc<Mutex<Option<Result<(), String>>>>,
     success_banner: bool,
     reset_after_flash: bool,
+    /// When Some, render the centered confirm dialog. Holds the Config that
+    /// will be used if the user confirms (so we don't re-validate).
+    pending_confirm: Option<Config>,
+    /// When Some, render a red error overlay. Any key dismisses it.
+    error_msg: Option<String>,
 }
 
 pub fn run() -> Result<()> {
@@ -51,8 +56,6 @@ pub fn run() -> Result<()> {
         Ok(d) => (d, None),
         Err(e) => (Vec::new(), Some(e.to_string())),
     };
-    // Best-effort capacity probe; failures are surfaced in the log but don't
-    // block opening the TUI (the user can still see device info etc).
     let (sd_total_bytes, probe_err) = match device::probe_sd_size() {
         Ok(s) => (Some(s), None),
         Err(e) => (None, Some(e.to_string())),
@@ -79,6 +82,8 @@ pub fn run() -> Result<()> {
         flash_result: Arc::new(Mutex::new(None)),
         success_banner: false,
         reset_after_flash: true,
+        pending_confirm: None,
+        error_msg: None,
     };
 
     let mut terminal = setup_terminal()?;
@@ -102,6 +107,14 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result
     Ok(())
 }
 
+/// What the event handler decided. Errors from operations that the user can
+/// recover from (parse failures, picker errors, etc.) are turned into
+/// `error_msg` overlays instead of crashing the TUI.
+enum Tick {
+    Continue,
+    Quit,
+}
+
 fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     app: &mut App,
@@ -111,72 +124,10 @@ fn event_loop(
 
         if event::poll(std::time::Duration::from_millis(100))? {
             let evt = event::read()?;
-            if let Event::Key(key) = &evt {
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
-
-                // Ctrl-C always exits, even mid-flash (flash thread will abort
-                // when its USB calls fail; user accepted the risk).
-                if key.modifiers.contains(KeyModifiers::CONTROL)
-                    && matches!(key.code, KeyCode::Char('c'))
-                {
-                    return Ok(());
-                }
-
-                // Dismiss the success overlay on any key once it's shown.
-                if app.success_banner {
-                    app.success_banner = false;
-                    continue;
-                }
-
-                let busy = *app.flashing.lock().unwrap();
-                if busy {
-                    // Don't quit mid-flash via plain q/Esc — would corrupt the SD card.
-                    continue;
-                }
-
-                match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-                    KeyCode::Tab => {
-                        app.focus = match app.focus {
-                            Focus::Picker => Focus::Size,
-                            Focus::Size => Focus::FlashButton,
-                            Focus::FlashButton => Focus::Picker,
-                        };
-                        continue;
-                    }
-                    KeyCode::Char('r') if app.focus != Focus::Size => {
-                        // Toggle reset-after-flash. Disabled while typing in the size field.
-                        app.reset_after_flash = !app.reset_after_flash;
-                        continue;
-                    }
-                    _ => {}
-                }
-
-                match app.focus {
-                    Focus::Picker => {
-                        if matches!(key.code, KeyCode::Enter) {
-                            let f = app.explorer.current();
-                            if f.is_file() {
-                                on_image_selected(app, f.path().clone());
-                                continue;
-                            }
-                        }
-                        app.explorer.handle(&evt)?;
-                    }
-                    Focus::Size => match key.code {
-                        KeyCode::Char(c) => app.size_input.push(c),
-                        KeyCode::Backspace => { app.size_input.pop(); }
-                        KeyCode::Enter => app.focus = Focus::FlashButton,
-                        _ => {}
-                    },
-                    Focus::FlashButton => {
-                        if matches!(key.code, KeyCode::Enter | KeyCode::Char(' ')) {
-                            start_flash(app)?;
-                        }
-                    }
-                }
+            match handle_event(app, &evt) {
+                Ok(Tick::Quit) => return Ok(()),
+                Ok(Tick::Continue) => {}
+                Err(e) => app.error_msg = Some(e.to_string()),
             }
         }
 
@@ -188,12 +139,111 @@ fn event_loop(
                     app.log.lock().unwrap().push("Flash completed.".to_string());
                     app.success_banner = true;
                 }
-                Err(e) => app.log.lock().unwrap().push(format!("Flash failed: {e}")),
+                Err(e) => {
+                    app.log.lock().unwrap().push(format!("Flash failed: {e}"));
+                    app.error_msg = Some(format!("Flash failed:\n{e}"));
+                }
             }
             *app.flashing.lock().unwrap() = false;
             *app.progress.lock().unwrap() = None;
         }
     }
+}
+
+fn handle_event(app: &mut App, evt: &Event) -> Result<Tick> {
+    let Event::Key(key) = evt else { return Ok(Tick::Continue) };
+    if key.kind != KeyEventKind::Press {
+        return Ok(Tick::Continue);
+    }
+
+    // Ctrl-C always exits, even mid-flash.
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('c'))
+    {
+        return Ok(Tick::Quit);
+    }
+
+    // Modal overlays consume input first.
+    if app.error_msg.is_some() {
+        app.error_msg = None;
+        return Ok(Tick::Continue);
+    }
+    if app.success_banner {
+        app.success_banner = false;
+        return Ok(Tick::Continue);
+    }
+    if app.pending_confirm.is_some() {
+        return handle_confirm_key(app, key);
+    }
+
+    // Don't quit mid-flash via plain q/Esc — would corrupt the SD card.
+    if *app.flashing.lock().unwrap() {
+        return Ok(Tick::Continue);
+    }
+
+    match key.code {
+        KeyCode::Char('q') | KeyCode::Esc => return Ok(Tick::Quit),
+        KeyCode::Tab => {
+            app.focus = match app.focus {
+                Focus::Picker => Focus::Size,
+                Focus::Size => Focus::FlashButton,
+                Focus::FlashButton => Focus::Picker,
+            };
+            return Ok(Tick::Continue);
+        }
+        KeyCode::Char('r') if app.focus != Focus::Size => {
+            app.reset_after_flash = !app.reset_after_flash;
+            return Ok(Tick::Continue);
+        }
+        _ => {}
+    }
+
+    match app.focus {
+        Focus::Picker => {
+            if matches!(key.code, KeyCode::Enter) {
+                let f = app.explorer.current();
+                if f.is_file() {
+                    on_image_selected(app, f.path().clone());
+                    return Ok(Tick::Continue);
+                }
+            }
+            app.explorer.handle(evt)?;
+        }
+        Focus::Size => match key.code {
+            KeyCode::Char(c) => app.size_input.push(c),
+            KeyCode::Backspace => { app.size_input.pop(); }
+            KeyCode::Enter => app.focus = Focus::FlashButton,
+            _ => {}
+        },
+        Focus::FlashButton => {
+            if matches!(key.code, KeyCode::Enter | KeyCode::Char(' ')) {
+                open_confirmation(app)?;
+            }
+        }
+    }
+    Ok(Tick::Continue)
+}
+
+fn handle_confirm_key(app: &mut App, key: &crossterm::event::KeyEvent) -> Result<Tick> {
+    match key.code {
+        KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+            let cfg = app.pending_confirm.take().expect("checked above");
+            kickoff_flash(app, cfg);
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => {
+            app.pending_confirm = None;
+        }
+        KeyCode::Char('r') | KeyCode::Char('R') => {
+            // Toggle reset preference and update the held config so the
+            // dialog re-renders with the new value.
+            app.reset_after_flash = !app.reset_after_flash;
+            if let Some(cfg) = app.pending_confirm.as_mut() {
+                cfg.reset_after_flash = app.reset_after_flash;
+            }
+        }
+        _ => {}
+    }
+    Ok(Tick::Continue)
 }
 
 fn on_image_selected(app: &mut App, path: PathBuf) {
@@ -209,18 +259,15 @@ fn on_image_selected(app: &mut App, path: PathBuf) {
     if let Some(total) = app.sd_total_bytes {
         let max = flash::max_rootfs_bytes(total);
         if img_len > max {
-            app.log.lock().unwrap().push(format!(
-                "Image is {} MiB but SD only fits a {} MiB rootfs (half of SD - GPT). \
-                 Pick a smaller image or larger card.",
+            app.error_msg = Some(format!(
+                "Image is {} MiB but SD only fits a {} MiB rootfs (half of SD - GPT).\n\
+                 Pick a smaller image or use a larger card.",
                 img_len / (1024 * 1024),
                 max / (1024 * 1024),
             ));
-            // leave size_input untouched so user notices the problem
             return;
         }
         if rounded > max {
-            // round DOWN to a whole MiB so it fits, prefer 128 MiB granularity
-            // when it doesn't drop us below the image size
             let mib = 1024 * 1024;
             let max_mib_floor = max / mib * mib;
             let granular = max / (flash::DEFAULT_ROUND_MIB * mib)
@@ -237,50 +284,54 @@ fn on_image_selected(app: &mut App, path: PathBuf) {
     app.size_input = format!("{mib}MiB");
 }
 
-fn start_flash(app: &mut App) -> Result<()> {
+/// Validate inputs and stage a Config in `pending_confirm`. Errors here go
+/// into the red overlay, not the log, since they block the user's intent.
+fn open_confirmation(app: &mut App) -> Result<()> {
     let image = app
         .selected_image
         .clone()
         .ok_or_else(|| anyhow!("Select an image first (focus the file picker, press Enter)"))?;
     let size_bytes = flash::parse_size(&app.size_input)
         .map_err(|e| anyhow!("Invalid size: {e}"))?;
+    if size_bytes == 0 {
+        return Err(anyhow!("Rootfs size must be > 0"));
+    }
     if size_bytes % SECTOR_SIZE != 0 {
-        app.log.lock().unwrap().push(format!(
-            "Size {} bytes is not a multiple of sector size {}", size_bytes, SECTOR_SIZE
+        return Err(anyhow!(
+            "Size {} bytes is not a multiple of sector size {}",
+            size_bytes, SECTOR_SIZE
         ));
-        return Ok(());
     }
     if let Some(total) = app.sd_total_bytes {
         let max = flash::max_rootfs_bytes(total);
         if size_bytes > max {
-            app.log.lock().unwrap().push(format!(
+            return Err(anyhow!(
                 "Rootfs size {} MiB > {} MiB (half of SD - GPT). Won't fit.",
                 size_bytes / (1024 * 1024),
                 max / (1024 * 1024),
             ));
-            return Ok(());
         }
     }
-    // Image vs partition check (mirrors flash_image's guard so the user sees
-    // the error before pressing Flash launches a worker thread).
     if let Ok(meta) = std::fs::metadata(&image) {
         if meta.len() > size_bytes {
-            app.log.lock().unwrap().push(format!(
+            return Err(anyhow!(
                 "Image is {} MiB but rootfs partition is only {} MiB; pick rootfs >= {} MiB.",
                 meta.len() / (1024 * 1024),
                 size_bytes / (1024 * 1024),
                 meta.len().div_ceil(1024 * 1024),
             ));
-            return Ok(());
         }
     }
 
-    let cfg = Config {
-        image: image.clone(),
+    app.pending_confirm = Some(Config {
+        image,
         rootfs_size_bytes: size_bytes,
         reset_after_flash: app.reset_after_flash,
-    };
+    });
+    Ok(())
+}
 
+fn kickoff_flash(app: &mut App, cfg: Config) {
     *app.flashing.lock().unwrap() = true;
     let log = app.log.clone();
     let progress = app.progress.clone();
@@ -288,7 +339,7 @@ fn start_flash(app: &mut App) -> Result<()> {
 
     log.lock().unwrap().push(format!(
         "Starting flash: image={} rootfs_size={} bytes reset={}",
-        image.display(), size_bytes, cfg.reset_after_flash,
+        cfg.image.display(), cfg.rootfs_size_bytes, cfg.reset_after_flash,
     ));
 
     thread::spawn(move || {
@@ -300,7 +351,6 @@ fn start_flash(app: &mut App) -> Result<()> {
         })();
         *result_slot.lock().unwrap() = Some(res.map_err(|e| e.to_string()));
     });
-    Ok(())
 }
 
 struct TuiReport {
@@ -364,8 +414,15 @@ fn draw(f: &mut ratatui::Frame<'_>, app: &App) {
     draw_button(f, app, chunks[3]);
     draw_log(f, app, chunks[4]);
 
+    // Overlays in priority order (last drawn = on top)
+    if let Some(cfg) = &app.pending_confirm {
+        draw_confirm_overlay(f, app, cfg, f.area());
+    }
     if app.success_banner {
         draw_success_overlay(f, app, f.area());
+    }
+    if let Some(msg) = &app.error_msg {
+        draw_error_overlay(f, msg, f.area());
     }
 }
 
@@ -454,7 +511,7 @@ fn draw_button(f: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
         Style::default().add_modifier(Modifier::BOLD)
     };
     let title = format!(
-        "Flash (Enter)  ·  reset-after-flash: {}",
+        "Flash (Enter)  ·  reset-after-flash: {}  (press r to toggle)",
         if app.reset_after_flash { "ON" } else { "off" }
     );
     let p = Paragraph::new(Span::styled(label, style)).block(
@@ -489,12 +546,7 @@ fn draw_success_overlay(f: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
     } else {
         "Flash completed."
     };
-    let w = (msg.len() as u16 + 6).min(area.width);
-    let h = 5u16.min(area.height);
-    let x = area.x + (area.width.saturating_sub(w)) / 2;
-    let y = area.y + (area.height.saturating_sub(h)) / 2;
-    let popup = Rect { x, y, width: w, height: h };
-
+    let popup = centered_rect(area, (msg.len() as u16 + 6).max(40), 5);
     f.render_widget(Clear, popup);
     let block = Block::default()
         .borders(Borders::ALL)
@@ -508,6 +560,109 @@ fn draw_success_overlay(f: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
     .block(block)
     .alignment(ratatui::layout::Alignment::Center);
     f.render_widget(p, popup);
+}
+
+fn draw_error_overlay(f: &mut ratatui::Frame<'_>, msg: &str, area: Rect) {
+    let line_count = msg.lines().count() as u16;
+    let h = (line_count + 4).clamp(5, area.height.saturating_sub(2));
+    let w = msg
+        .lines()
+        .map(|l| l.len() as u16)
+        .max()
+        .unwrap_or(40)
+        .saturating_add(6)
+        .clamp(30, area.width.saturating_sub(4));
+    let popup = centered_rect(area, w, h);
+    f.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+        .title(" Error ");
+    let lines: Vec<Line> = msg
+        .lines()
+        .map(|l| Line::from(Span::styled(l.to_string(), Style::default().fg(Color::Red))))
+        .chain(std::iter::once(Line::from("")))
+        .chain(std::iter::once(Line::from(Span::styled(
+            "press any key to dismiss",
+            Style::default().fg(Color::DarkGray),
+        ))))
+        .collect();
+    let p = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+    f.render_widget(p, popup);
+}
+
+fn draw_confirm_overlay(f: &mut ratatui::Frame<'_>, app: &App, cfg: &Config, area: Rect) {
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        "Confirm flash",
+        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(""));
+
+    let mib = 1024 * 1024;
+    let push = |lines: &mut Vec<Line>, k: &str, v: String| {
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {k:<22}"), Style::default().fg(Color::DarkGray)),
+            Span::raw(v),
+        ]));
+    };
+
+    push(&mut lines, "image", cfg.image.display().to_string());
+    if let Ok(meta) = std::fs::metadata(&cfg.image) {
+        push(&mut lines, "image size", format!("{} MiB ({} bytes)", meta.len() / mib, meta.len()));
+    }
+    push(&mut lines, "rootfs A size", format!("{} MiB", cfg.rootfs_size_bytes / mib));
+    push(&mut lines, "rootfs B size", format!("{} MiB", cfg.rootfs_size_bytes / mib));
+    let userdata_estimate = app.sd_total_bytes.map(|t| {
+        t.saturating_sub(2 * cfg.rootfs_size_bytes)
+            .saturating_sub(flash::GPT_OVERHEAD_BYTES)
+    });
+    if let Some(u) = userdata_estimate {
+        push(&mut lines, "userdata (approx)", format!("{} MiB", u / mib));
+    }
+    if let Some(s) = app.sd_total_bytes {
+        push(&mut lines, "SD total", format!("{} MiB", s / mib));
+    }
+    if !app.devices.is_empty() {
+        let d = &app.devices[0];
+        push(&mut lines, "device", format!("RockUSB bus {} addr {}", d.bus, d.address));
+    }
+    push(
+        &mut lines,
+        "reset-after-flash",
+        if cfg.reset_after_flash { "ON".to_string() } else { "off".to_string() },
+    );
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "[y/Enter] confirm    [n/Esc] cancel    [r] toggle reset-after-flash",
+        Style::default().fg(Color::DarkGray),
+    )));
+    lines.push(Line::from(Span::styled(
+        "WARNING: this erases the entire SD card.",
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+    )));
+
+    let h = (lines.len() as u16 + 2).min(area.height.saturating_sub(2));
+    let w = 70u16.min(area.width.saturating_sub(4));
+    let popup = centered_rect(area, w, h);
+    f.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+        .title(" Confirm ");
+    let p = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+    f.render_widget(p, popup);
+}
+
+fn centered_rect(area: Rect, w: u16, h: u16) -> Rect {
+    let w = w.min(area.width);
+    let h = h.min(area.height);
+    Rect {
+        x: area.x + (area.width.saturating_sub(w)) / 2,
+        y: area.y + (area.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h,
+    }
 }
 
 fn border_style(active: bool) -> Style {
