@@ -681,8 +681,21 @@ fn draw_confirm_overlay(f: &mut ratatui::Frame<'_>, app: &App, cfg: &Config, are
         Style::default().fg(Color::DarkGray),
     )));
 
-    let h = (lines.len() as u16 + 2).min(area.height.saturating_sub(2));
-    let w = 70u16.min(area.width.saturating_sub(4));
+    // Width: prefer 80 so the long warning lines don't wrap. Fall back if
+    // the terminal is narrower. Then size the popup to actually fit the
+    // wrapped content — Paragraph clips overflow, and we don't want the
+    // key-hint or warning rows to fall off the bottom (which is what
+    // happened when userdata-magic was on and the userdata warning
+    // wrapped onto a second row).
+    let w = 80u16.min(area.width.saturating_sub(4)).max(40);
+    let inner_w = w.saturating_sub(2) as usize;
+    let mut needed = 0u16;
+    for line in &lines {
+        let lw = line.width().max(1);
+        let rows = lw.div_ceil(inner_w.max(1));
+        needed = needed.saturating_add(rows.max(1) as u16);
+    }
+    let h = (needed + 2).min(area.height.saturating_sub(2));
     let popup = centered_rect(area, w, h);
     f.render_widget(Clear, popup);
     let block = Block::default()
