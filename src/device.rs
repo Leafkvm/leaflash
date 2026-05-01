@@ -1,6 +1,7 @@
 use anyhow::{Result, anyhow};
-use rockusb::libusb::{Devices, DeviceUnavalable, Transport};
 use rockusb::device::Device;
+use rockusb::libusb::{DeviceUnavalable, Devices, Transport};
+use rockusb::protocol::StorageIndex;
 
 pub fn open_single() -> Result<Device<Transport>> {
     let devices = Devices::new()?;
@@ -46,4 +47,13 @@ pub struct DeviceSummary {
     pub bus: u8,
     pub address: u8,
     pub available: bool,
+}
+
+/// Open the device, switch to SD storage, and read its capacity. Used by
+/// the TUI to size-check images before flashing.
+pub fn probe_sd_size() -> Result<u64> {
+    let mut device = open_single()?;
+    device.switch_storage(StorageIndex::Sd)?;
+    let info = device.flash_info()?;
+    Ok(info.size())
 }

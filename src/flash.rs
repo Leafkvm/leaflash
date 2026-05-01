@@ -1,6 +1,6 @@
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Result, anyhow, bail, ensure};
 use clap::Args;
@@ -8,7 +8,7 @@ use gptman::{GPT, GPTPartitionEntry};
 use indicatif::{ProgressBar, ProgressStyle};
 use rockusb::device::Device;
 use rockusb::libusb::Transport;
-use rockusb::protocol::StorageIndex;
+use rockusb::protocol::{ResetOpcode, StorageIndex};
 
 use crate::device;
 
@@ -25,6 +25,16 @@ const ATTR_LEGACY_BIOS_BOOTABLE: u64 = 0x4;
 /// override the rootfs size. Exported so the TUI stays consistent.
 pub const DEFAULT_ROUND_MIB: u64 = 128;
 
+/// Reservation for GPT primary + protective MBR + backup GPT + alignment slack.
+/// 4 MiB is comfortably more than the standard ~67 sectors actually used.
+pub const GPT_OVERHEAD_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Largest single rootfs (A == B) that fits on a card of the given total size,
+/// leaving GPT overhead and zero bytes for userdata. Anything larger is invalid.
+pub fn max_rootfs_bytes(total_storage_bytes: u64) -> u64 {
+    total_storage_bytes.saturating_sub(GPT_OVERHEAD_BYTES) / 2
+}
+
 #[derive(Debug, Args, Clone)]
 pub struct FlashArgs {
     /// Image file to write into rootfs_a (raw, sector-aligned)
@@ -33,18 +43,43 @@ pub struct FlashArgs {
     /// Size of each rootfs partition (A and B), e.g. "256MiB", "512M", "1GiB"
     #[arg(long, value_parser = parse_size)]
     pub rootfs_size: u64,
+    /// Reset the device after the image is written (boots into the new image)
+    #[arg(long, default_value_t = false)]
+    pub reset_after_flash: bool,
+}
+
+/// All inputs to `flash_image`. Add fields here instead of widening the
+/// `flash_image` signature.
+#[derive(Debug, Clone)]
+pub struct Config {
+    pub image: PathBuf,
+    pub rootfs_size_bytes: u64,
+    pub reset_after_flash: bool,
+}
+
+impl From<&FlashArgs> for Config {
+    fn from(a: &FlashArgs) -> Self {
+        Self {
+            image: a.image.clone(),
+            rootfs_size_bytes: a.rootfs_size,
+            reset_after_flash: a.reset_after_flash,
+        }
+    }
 }
 
 pub fn run(args: FlashArgs) -> Result<()> {
     let device = device::open_single()?;
     let report = ProgressReporter::Cli;
-    flash_image(device, &args.image, args.rootfs_size, &report)?;
-    println!("Done.");
+    let cfg = Config::from(&args);
+    flash_image(device, &cfg, &report)?;
+    println!(
+        "Done.{}",
+        if cfg.reset_after_flash { " Device reset." } else { "" }
+    );
     Ok(())
 }
 
-/// Parse human-readable sizes like "256MiB", "512M", "1GiB".
-/// Returns size in bytes.
+/// Parse human-readable sizes like "256MiB", "512M", "1GiB". Returns bytes.
 pub fn parse_size(s: &str) -> Result<u64, String> {
     let s = s.trim();
     let (num, unit) = s
@@ -62,7 +97,7 @@ pub fn parse_size(s: &str) -> Result<u64, String> {
         "gib" => 1024 * 1024 * 1024,
         other => return Err(format!("unknown size unit: {other}")),
     };
-    Ok(n.checked_mul(mult).ok_or("size overflow")?)
+    n.checked_mul(mult).ok_or_else(|| "size overflow".to_string())
 }
 
 /// Round a byte count up to the nearest multiple of `granularity` MiB.
@@ -118,24 +153,23 @@ impl ProgressHandle for CliProgress {
 /// subcommand and the TUI route through here.
 pub fn flash_image(
     mut device: Device<Transport>,
-    image: &Path,
-    rootfs_size_bytes: u64,
+    cfg: &Config,
     report: &dyn Report,
 ) -> Result<()> {
-    ensure!(rootfs_size_bytes > 0, "rootfs size must be > 0");
+    ensure!(cfg.rootfs_size_bytes > 0, "rootfs size must be > 0");
     ensure!(
-        rootfs_size_bytes % SECTOR_SIZE == 0,
+        cfg.rootfs_size_bytes % SECTOR_SIZE == 0,
         "rootfs size must be a multiple of {SECTOR_SIZE} bytes"
     );
 
-    let img_file = File::open(image)
-        .map_err(|e| anyhow!("failed to open image {}: {}", image.display(), e))?;
+    let img_file = File::open(&cfg.image)
+        .map_err(|e| anyhow!("failed to open image {}: {}", cfg.image.display(), e))?;
     let img_len = img_file.metadata()?.len();
     ensure!(
-        img_len <= rootfs_size_bytes,
+        img_len <= cfg.rootfs_size_bytes,
         "image is {} bytes but rootfs partition is only {} bytes",
         img_len,
-        rootfs_size_bytes
+        cfg.rootfs_size_bytes
     );
 
     report.stage("Switching storage to SD...");
@@ -148,23 +182,25 @@ pub fn flash_image(
     let info = device.flash_info()?;
     let total_sectors = info.sectors();
     ensure!(total_sectors > 0, "SD card reports 0 sectors");
+    let total_bytes = info.size();
     report.stage(&format!(
         "SD card: {} MiB ({} sectors)",
-        info.size() / (1024 * 1024),
+        total_bytes / (1024 * 1024),
         total_sectors
     ));
 
-    let rootfs_sectors = rootfs_size_bytes / SECTOR_SIZE;
-    let needed_sectors = rootfs_sectors
-        .checked_mul(2)
-        .and_then(|x| x.checked_add(2048))
-        .ok_or_else(|| anyhow!("rootfs sizing overflow"))?;
-    ensure!(
-        total_sectors as u64 >= needed_sectors,
-        "SD card too small: need at least {} sectors for 2x rootfs, have {}",
-        needed_sectors,
-        total_sectors
-    );
+    let max = max_rootfs_bytes(total_bytes);
+    if cfg.rootfs_size_bytes > max {
+        bail!(
+            "rootfs size {} MiB > {} MiB (half of SD minus GPT overhead). \
+             Pick --rootfs-size <= {} MiB or use a larger card.",
+            cfg.rootfs_size_bytes / (1024 * 1024),
+            max / (1024 * 1024),
+            max / (1024 * 1024)
+        );
+    }
+
+    let rootfs_sectors = cfg.rootfs_size_bytes / SECTOR_SIZE;
 
     let mut bar = report.progress_begin(total_sectors as u64, "Erasing card...");
     let erase_chunk: u32 = 32 * 1024;
@@ -240,10 +276,10 @@ pub fn flash_image(
 
     report.stage(&format!(
         "Writing image {} -> rootfs_a (LBA {})...",
-        image.display(),
+        cfg.image.display(),
         a_start
     ));
-    let mut img = File::open(image)?;
+    let mut img = File::open(&cfg.image)?;
     io.seek(SeekFrom::Start(a_start * SECTOR_SIZE))?;
     let mut bar = report.progress_begin(img_len, "Writing image...");
     let mut buf = vec![0u8; 1024 * 1024];
@@ -255,6 +291,16 @@ pub fn flash_image(
     }
     io.flush()?;
     bar.finish();
+
+    if cfg.reset_after_flash {
+        report.stage("Resetting device...");
+        let mut device = io.into_inner();
+        // The reset itself yanks the USB endpoint; rockusb may surface that
+        // as an error even though the reset succeeded. Don't fail the flash.
+        if let Err(e) = device.reset_device(ResetOpcode::Reset) {
+            report.stage(&format!("Reset returned {} (often expected — USB disconnects mid-call)", e));
+        }
+    }
 
     Ok(())
 }

@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use anyhow::{Result, anyhow};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -14,11 +14,11 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui_explorer::FileExplorer;
 
 use crate::device;
-use crate::flash::{self, Report, ProgressHandle};
+use crate::flash::{self, Config, ProgressHandle, Report};
 
 const SECTOR_SIZE: u64 = flash::SECTOR_SIZE;
 
@@ -39,7 +39,10 @@ struct App {
     flashing: Arc<Mutex<bool>>,
     devices: Vec<device::DeviceSummary>,
     device_err: Option<String>,
+    sd_total_bytes: Option<u64>,
     flash_result: Arc<Mutex<Option<Result<(), String>>>>,
+    success_banner: bool,
+    reset_after_flash: bool,
 }
 
 pub fn run() -> Result<()> {
@@ -48,18 +51,34 @@ pub fn run() -> Result<()> {
         Ok(d) => (d, None),
         Err(e) => (Vec::new(), Some(e.to_string())),
     };
+    // Best-effort capacity probe; failures are surfaced in the log but don't
+    // block opening the TUI (the user can still see device info etc).
+    let (sd_total_bytes, probe_err) = match device::probe_sd_size() {
+        Ok(s) => (Some(s), None),
+        Err(e) => (None, Some(e.to_string())),
+    };
+
+    let mut log: Vec<String> = Vec::new();
+    if let Some(s) = sd_total_bytes {
+        log.push(format!("SD capacity: {} MiB", s / (1024 * 1024)));
+    } else if let Some(e) = probe_err {
+        log.push(format!("Could not probe SD capacity: {e}"));
+    }
 
     let mut app = App {
         explorer,
         selected_image: None,
         size_input: "256MiB".to_string(),
         focus: Focus::Picker,
-        log: Arc::new(Mutex::new(Vec::new())),
+        log: Arc::new(Mutex::new(log)),
         progress: Arc::new(Mutex::new(None)),
         flashing: Arc::new(Mutex::new(false)),
         devices,
         device_err,
+        sd_total_bytes,
         flash_result: Arc::new(Mutex::new(None)),
+        success_banner: false,
+        reset_after_flash: true,
     };
 
     let mut terminal = setup_terminal()?;
@@ -97,11 +116,23 @@ fn event_loop(
                     continue;
                 }
 
+                // Ctrl-C always exits, even mid-flash (flash thread will abort
+                // when its USB calls fail; user accepted the risk).
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && matches!(key.code, KeyCode::Char('c'))
+                {
+                    return Ok(());
+                }
+
+                // Dismiss the success overlay on any key once it's shown.
+                if app.success_banner {
+                    app.success_banner = false;
+                    continue;
+                }
+
                 let busy = *app.flashing.lock().unwrap();
                 if busy {
-                    if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) {
-                        // ignore quit while flashing — would corrupt the SD card
-                    }
+                    // Don't quit mid-flash via plain q/Esc — would corrupt the SD card.
                     continue;
                 }
 
@@ -115,6 +146,11 @@ fn event_loop(
                         };
                         continue;
                     }
+                    KeyCode::Char('r') if app.focus != Focus::Size => {
+                        // Toggle reset-after-flash. Disabled while typing in the size field.
+                        app.reset_after_flash = !app.reset_after_flash;
+                        continue;
+                    }
                     _ => {}
                 }
 
@@ -123,13 +159,7 @@ fn event_loop(
                         if matches!(key.code, KeyCode::Enter) {
                             let f = app.explorer.current();
                             if f.is_file() {
-                                app.selected_image = Some(f.path().clone());
-                                if let Ok(meta) = std::fs::metadata(f.path()) {
-                                    let rounded = flash::round_up_mib(meta.len(), flash::DEFAULT_ROUND_MIB);
-                                    let mib = rounded / (1024 * 1024);
-                                    app.size_input = format!("{mib}MiB");
-                                }
-                                app.focus = Focus::Size;
+                                on_image_selected(app, f.path().clone());
                                 continue;
                             }
                         }
@@ -154,13 +184,57 @@ fn event_loop(
         let mut result_slot = app.flash_result.lock().unwrap();
         if let Some(res) = result_slot.take() {
             match res {
-                Ok(()) => app.log.lock().unwrap().push("Flash completed.".to_string()),
+                Ok(()) => {
+                    app.log.lock().unwrap().push("Flash completed.".to_string());
+                    app.success_banner = true;
+                }
                 Err(e) => app.log.lock().unwrap().push(format!("Flash failed: {e}")),
             }
             *app.flashing.lock().unwrap() = false;
             *app.progress.lock().unwrap() = None;
         }
     }
+}
+
+fn on_image_selected(app: &mut App, path: PathBuf) {
+    app.selected_image = Some(path.clone());
+    app.focus = Focus::Size;
+
+    let Ok(meta) = std::fs::metadata(&path) else {
+        return;
+    };
+    let img_len = meta.len();
+    let mut rounded = flash::round_up_mib(img_len, flash::DEFAULT_ROUND_MIB);
+
+    if let Some(total) = app.sd_total_bytes {
+        let max = flash::max_rootfs_bytes(total);
+        if img_len > max {
+            app.log.lock().unwrap().push(format!(
+                "Image is {} MiB but SD only fits a {} MiB rootfs (half of SD - GPT). \
+                 Pick a smaller image or larger card.",
+                img_len / (1024 * 1024),
+                max / (1024 * 1024),
+            ));
+            // leave size_input untouched so user notices the problem
+            return;
+        }
+        if rounded > max {
+            // round DOWN to a whole MiB so it fits, prefer 128 MiB granularity
+            // when it doesn't drop us below the image size
+            let mib = 1024 * 1024;
+            let max_mib_floor = max / mib * mib;
+            let granular = max / (flash::DEFAULT_ROUND_MIB * mib)
+                * (flash::DEFAULT_ROUND_MIB * mib);
+            rounded = if granular >= img_len { granular } else { max_mib_floor };
+            app.log.lock().unwrap().push(format!(
+                "Default 128-MiB round-up wouldn't fit; capped rootfs at {} MiB.",
+                rounded / mib,
+            ));
+        }
+    }
+
+    let mib = rounded / (1024 * 1024);
+    app.size_input = format!("{mib}MiB");
 }
 
 fn start_flash(app: &mut App) -> Result<()> {
@@ -176,6 +250,23 @@ fn start_flash(app: &mut App) -> Result<()> {
         ));
         return Ok(());
     }
+    if let Some(total) = app.sd_total_bytes {
+        let max = flash::max_rootfs_bytes(total);
+        if size_bytes > max {
+            app.log.lock().unwrap().push(format!(
+                "Rootfs size {} MiB > {} MiB (half of SD - GPT). Won't fit.",
+                size_bytes / (1024 * 1024),
+                max / (1024 * 1024),
+            ));
+            return Ok(());
+        }
+    }
+
+    let cfg = Config {
+        image: image.clone(),
+        rootfs_size_bytes: size_bytes,
+        reset_after_flash: app.reset_after_flash,
+    };
 
     *app.flashing.lock().unwrap() = true;
     let log = app.log.clone();
@@ -183,14 +274,15 @@ fn start_flash(app: &mut App) -> Result<()> {
     let result_slot = app.flash_result.clone();
 
     log.lock().unwrap().push(format!(
-        "Starting flash: image={} rootfs_size={} bytes", image.display(), size_bytes
+        "Starting flash: image={} rootfs_size={} bytes reset={}",
+        image.display(), size_bytes, cfg.reset_after_flash,
     ));
 
     thread::spawn(move || {
         let report = TuiReport { log: log.clone(), progress: progress.clone() };
         let res: Result<()> = (|| {
             let dev = device::open_single()?;
-            flash::flash_image(dev, &image, size_bytes, &report)?;
+            flash::flash_image(dev, &cfg, &report)?;
             Ok(())
         })();
         *result_slot.lock().unwrap() = Some(res.map_err(|e| e.to_string()));
@@ -241,14 +333,11 @@ impl ProgressHandle for TuiProgress {
 }
 
 fn draw(f: &mut ratatui::Frame<'_>, app: &App) {
+    let dev_lines = devices_line_count(app);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(if app.devices.is_empty() && app.device_err.is_none() {
-                3
-            } else {
-                3 + app.devices.len() as u16 + app.device_err.is_some() as u16
-            }),
+            Constraint::Length(2 + dev_lines),
             Constraint::Min(10),
             Constraint::Length(3),
             Constraint::Length(3),
@@ -261,6 +350,25 @@ fn draw(f: &mut ratatui::Frame<'_>, app: &App) {
     draw_size(f, app, chunks[2]);
     draw_button(f, app, chunks[3]);
     draw_log(f, app, chunks[4]);
+
+    if app.success_banner {
+        draw_success_overlay(f, app, f.area());
+    }
+}
+
+fn devices_line_count(app: &App) -> u16 {
+    let mut n = 0u16;
+    if app.device_err.is_some() {
+        n += 1;
+    } else if app.devices.is_empty() {
+        n += 1;
+    } else {
+        n += app.devices.len() as u16;
+    }
+    if app.sd_total_bytes.is_some() {
+        n += 1;
+    }
+    n.max(1)
 }
 
 fn draw_devices(f: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
@@ -281,11 +389,14 @@ fn draw_devices(f: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
             )));
         }
     }
+    if let Some(s) = app.sd_total_bytes {
+        lines.push(Line::from(format!("SD: {} MiB", s / (1024 * 1024))));
+    }
 
     let p = Paragraph::new(lines).block(
         Block::default()
             .borders(Borders::ALL)
-            .title("Devices (Tab to cycle focus, q to quit)"),
+            .title("Devices  (Tab cycles · q/Esc/Ctrl-C quits · r toggles reset-after-flash)"),
     );
     f.render_widget(p, area);
 }
@@ -329,11 +440,15 @@ fn draw_button(f: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
     } else {
         Style::default().add_modifier(Modifier::BOLD)
     };
+    let title = format!(
+        "Flash (Enter)  ·  reset-after-flash: {}",
+        if app.reset_after_flash { "ON" } else { "off" }
+    );
     let p = Paragraph::new(Span::styled(label, style)).block(
         Block::default()
             .borders(Borders::ALL)
             .border_style(border_style(app.focus == Focus::FlashButton))
-            .title("Flash (Enter)"),
+            .title(title),
     );
     f.render_widget(p, area);
 }
@@ -353,6 +468,33 @@ fn draw_log(f: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
         .wrap(Wrap { trim: false })
         .block(Block::default().borders(Borders::ALL).title("Log"));
     f.render_widget(p, area);
+}
+
+fn draw_success_overlay(f: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
+    let msg = if app.reset_after_flash {
+        "Flash completed and device rebooted."
+    } else {
+        "Flash completed."
+    };
+    let w = (msg.len() as u16 + 6).min(area.width);
+    let h = 5u16.min(area.height);
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let popup = Rect { x, y, width: w, height: h };
+
+    f.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
+        .title(" Success ");
+    let p = Paragraph::new(vec![
+        Line::from(""),
+        Line::from(Span::styled(msg, Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))),
+        Line::from(Span::styled("press any key to dismiss", Style::default().fg(Color::DarkGray))),
+    ])
+    .block(block)
+    .alignment(ratatui::layout::Alignment::Center);
+    f.render_widget(p, popup);
 }
 
 fn border_style(active: bool) -> Style {
