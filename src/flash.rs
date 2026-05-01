@@ -40,6 +40,75 @@ pub fn max_rootfs_bytes(total_storage_bytes: u64) -> u64 {
     total_storage_bytes.saturating_sub(GPT_OVERHEAD_BYTES) / 2
 }
 
+/// The on-disk LBA layout of the three partitions we manage. Used to
+/// compare what `flash_image` would write against what's already on the
+/// card, so we can skip the full erase + GPT rewrite when nothing about
+/// the layout changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Layout {
+    pub a_start: u64,
+    pub a_end: u64,
+    pub b_start: u64,
+    pub b_end: u64,
+    pub user_start: u64,
+    pub user_end: u64,
+}
+
+// gptman 1.x defaults: 128 partition entries (32 sectors), 1 MiB alignment.
+const GPT_ENTRIES_SECTORS: u64 = 32;
+const GPT_FIRST_USABLE_LBA: u64 = 2 + GPT_ENTRIES_SECTORS; // 34
+const GPT_ALIGN_SECTORS: u64 = 2048;
+
+/// Compute the LBAs that `flash_image` would write for a given disk +
+/// rootfs size. Mirrors gptman's defaults exactly so a comparison with
+/// the existing on-disk GPT is meaningful.
+pub fn expected_layout(total_sectors: u64, rootfs_size_bytes: u64) -> Result<Layout> {
+    let rootfs_sectors = rootfs_size_bytes / SECTOR_SIZE;
+    let last_usable = total_sectors
+        .checked_sub(GPT_ENTRIES_SECTORS + 2)
+        .ok_or_else(|| anyhow!("disk too small for a GPT"))?;
+    let a_start = align_up(GPT_FIRST_USABLE_LBA, GPT_ALIGN_SECTORS);
+    let a_end = a_start + rootfs_sectors - 1;
+    let b_start = align_up(a_end + 1, GPT_ALIGN_SECTORS);
+    let b_end = b_start + rootfs_sectors - 1;
+    let user_start = align_up(b_end + 1, GPT_ALIGN_SECTORS);
+    let user_end = last_usable;
+    if user_start >= user_end {
+        bail!("no room for userdata after rootfs_a + rootfs_b");
+    }
+    Ok(Layout { a_start, a_end, b_start, b_end, user_start, user_end })
+}
+
+/// Read the existing GPT and, if it has rootfs_a / rootfs_b / userdata
+/// partitions in slots 1..=3, return their LBAs. Returns None when the
+/// disk has no GPT, or has a GPT with different naming/slot usage.
+pub fn read_existing_layout<R>(io: &mut R) -> Option<Layout>
+where
+    R: std::io::Read + std::io::Seek,
+{
+    let gpt = GPT::find_from(io).ok()?;
+    let p1 = &gpt[1];
+    let p2 = &gpt[2];
+    let p3 = &gpt[3];
+    if !p1.is_used() || !p2.is_used() || !p3.is_used() {
+        return None;
+    }
+    if p1.partition_name.as_str() != "rootfs_a"
+        || p2.partition_name.as_str() != "rootfs_b"
+        || p3.partition_name.as_str() != "userdata"
+    {
+        return None;
+    }
+    Some(Layout {
+        a_start: p1.starting_lba,
+        a_end: p1.ending_lba,
+        b_start: p2.starting_lba,
+        b_end: p2.ending_lba,
+        user_start: p3.starting_lba,
+        user_end: p3.ending_lba,
+    })
+}
+
 #[derive(Debug, Args, Clone)]
 pub struct FlashArgs {
     /// Image file to write into rootfs_a (raw, sector-aligned)
@@ -217,87 +286,94 @@ pub fn flash_image(
         );
     }
 
-    let rootfs_sectors = cfg.rootfs_size_bytes / SECTOR_SIZE;
+    let layout = expected_layout(total_sectors as u64, cfg.rootfs_size_bytes)?;
 
-    let mut bar = report.progress_begin(total_sectors as u64, "Erasing card...");
-    let erase_chunk: u32 = 32 * 1024;
-    let mut start: u32 = 0;
-    while start < total_sectors {
-        let count = erase_chunk.min(total_sectors - start);
-        device.erase_lba(start, count as u16)?;
-        start += count;
-        bar.inc(count as u64);
+    // Inspect the existing GPT. If rootfs_a / rootfs_b / userdata are
+    // already at the LBAs we'd write, the flash is just an in-place
+    // rootfs_a refresh: skip the full erase and the GPT rewrite, leaving
+    // rootfs_b and userdata intact. Userdata-magic still writes its
+    // markers separately.
+    let mut io = device.into_io()?;
+    let existing = read_existing_layout(&mut io);
+    let preserve = existing == Some(layout);
+    let mut device = io.into_inner();
+
+    if preserve {
+        report.stage(
+            "Existing GPT matches; preserving rootfs_b and userdata, refreshing rootfs_a only.",
+        );
+        let a_count = layout.a_end - layout.a_start + 1;
+        let mut bar = report.progress_begin(a_count, "Erasing rootfs_a...");
+        chunk_erase(&mut device, layout.a_start as u32, a_count as u32, &mut *bar)?;
+        bar.finish();
+    } else {
+        report.stage(&format!(
+            "Erasing whole card ({} sectors)...",
+            total_sectors
+        ));
+        let mut bar = report.progress_begin(total_sectors as u64, "Erasing card...");
+        chunk_erase(&mut device, 0, total_sectors, &mut *bar)?;
+        bar.finish();
     }
-    bar.finish();
 
     std::thread::sleep(std::time::Duration::from_millis(100));
 
-    report.stage("Generating GPT (rootfs_a / rootfs_b / userdata)...");
     let mut io = device.into_io()?;
-    let mut gpt = GPT::new_from(&mut io, SECTOR_SIZE, random_guid())?;
 
-    let a_start = align_up(gpt.header.first_usable_lba, gpt.align);
-    let a_end = a_start + rootfs_sectors - 1;
-    gpt[1] = GPTPartitionEntry {
-        partition_type_guid: LINUX_FS_GUID,
-        unique_partition_guid: random_guid(),
-        starting_lba: a_start,
-        ending_lba: a_end,
-        attribute_bits: ATTR_LEGACY_BIOS_BOOTABLE,
-        partition_name: "rootfs_a".into(),
-    };
+    if !preserve {
+        report.stage("Generating GPT (rootfs_a / rootfs_b / userdata)...");
+        let mut gpt = GPT::new_from(&mut io, SECTOR_SIZE, random_guid())?;
+        gpt[1] = GPTPartitionEntry {
+            partition_type_guid: LINUX_FS_GUID,
+            unique_partition_guid: random_guid(),
+            starting_lba: layout.a_start,
+            ending_lba: layout.a_end,
+            attribute_bits: ATTR_LEGACY_BIOS_BOOTABLE,
+            partition_name: "rootfs_a".into(),
+        };
+        gpt[2] = GPTPartitionEntry {
+            partition_type_guid: LINUX_FS_GUID,
+            unique_partition_guid: random_guid(),
+            starting_lba: layout.b_start,
+            ending_lba: layout.b_end,
+            attribute_bits: 0,
+            partition_name: "rootfs_b".into(),
+        };
+        gpt[3] = GPTPartitionEntry {
+            partition_type_guid: LINUX_FS_GUID,
+            unique_partition_guid: random_guid(),
+            starting_lba: layout.user_start,
+            ending_lba: layout.user_end,
+            attribute_bits: 0,
+            partition_name: "userdata".into(),
+        };
 
-    let b_start = align_up(a_end + 1, gpt.align);
-    let b_end = b_start + rootfs_sectors - 1;
-    gpt[2] = GPTPartitionEntry {
-        partition_type_guid: LINUX_FS_GUID,
-        unique_partition_guid: random_guid(),
-        starting_lba: b_start,
-        ending_lba: b_end,
-        attribute_bits: 0,
-        partition_name: "rootfs_b".into(),
-    };
+        report.stage("Writing protective MBR + primary/backup GPT...");
+        GPT::write_protective_mbr_into(&mut io, SECTOR_SIZE)?;
+        gpt.write_into(&mut io)?;
+        io.flush()?;
 
-    let user_start = align_up(b_end + 1, gpt.align);
-    let user_end = gpt.header.last_usable_lba;
-    ensure!(
-        user_end > user_start,
-        "no room left for userdata after rootfs_a + rootfs_b"
-    );
-    gpt[3] = GPTPartitionEntry {
-        partition_type_guid: LINUX_FS_GUID,
-        unique_partition_guid: random_guid(),
-        starting_lba: user_start,
-        ending_lba: user_end,
-        attribute_bits: 0,
-        partition_name: "userdata".into(),
-    };
-
-    report.stage("Writing protective MBR + primary/backup GPT...");
-    GPT::write_protective_mbr_into(&mut io, SECTOR_SIZE)?;
-    gpt.write_into(&mut io)?;
-    io.flush()?;
-
-    for (i, p) in gpt.iter() {
-        if p.is_used() {
-            report.stage(&format!(
-                "  partition {}: {} {} MiB (LBA {}..={})",
-                i,
-                p.partition_name,
-                p.size().unwrap_or(0) * SECTOR_SIZE / (1024 * 1024),
-                p.starting_lba,
-                p.ending_lba,
-            ));
+        for (i, p) in gpt.iter() {
+            if p.is_used() {
+                report.stage(&format!(
+                    "  partition {}: {} {} MiB (LBA {}..={})",
+                    i,
+                    p.partition_name,
+                    p.size().unwrap_or(0) * SECTOR_SIZE / (1024 * 1024),
+                    p.starting_lba,
+                    p.ending_lba,
+                ));
+            }
         }
     }
 
     report.stage(&format!(
         "Writing image {} -> rootfs_a (LBA {})...",
         cfg.image.display(),
-        a_start
+        layout.a_start,
     ));
     let mut img = File::open(&cfg.image)?;
-    io.seek(SeekFrom::Start(a_start * SECTOR_SIZE))?;
+    io.seek(SeekFrom::Start(layout.a_start * SECTOR_SIZE))?;
     let mut bar = report.progress_begin(img_len, "Writing image...");
     let mut buf = vec![0u8; 1024 * 1024];
     loop {
@@ -313,8 +389,8 @@ pub fn flash_image(
         report.stage(
             "Writing userdata magic markers (bootloader will auto-wipe userdata on next boot)...",
         );
-        let userdata_first_byte = user_start * SECTOR_SIZE;
-        let userdata_last_byte = (user_end + 1) * SECTOR_SIZE;
+        let userdata_first_byte = layout.user_start * SECTOR_SIZE;
+        let userdata_last_byte = (layout.user_end + 1) * SECTOR_SIZE;
         let trailing_offset = userdata_last_byte - USERDATA_MAGIC.len() as u64;
 
         io.seek(SeekFrom::Start(userdata_first_byte))?;
@@ -336,6 +412,25 @@ pub fn flash_image(
         }
     }
 
+    Ok(())
+}
+
+fn chunk_erase(
+    device: &mut Device<Transport>,
+    first: u32,
+    count: u32,
+    bar: &mut dyn ProgressHandle,
+) -> Result<()> {
+    let chunk: u32 = 32 * 1024;
+    let mut remaining = count;
+    let mut start = first;
+    while remaining > 0 {
+        let n = chunk.min(remaining);
+        device.erase_lba(start, n as u16)?;
+        start = start.saturating_add(n);
+        remaining -= n;
+        bar.inc(n as u64);
+    }
     Ok(())
 }
 

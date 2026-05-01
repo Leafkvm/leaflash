@@ -49,11 +49,28 @@ pub struct DeviceSummary {
     pub available: bool,
 }
 
-/// Open the device, switch to SD storage, and read its capacity. Used by
-/// the TUI to size-check images before flashing.
-pub fn probe_sd_size() -> Result<u64> {
+/// Capacity probe + read of the on-disk GPT (if any). Used by the TUI to
+/// drive the confirm dialog: if the existing partition table already
+/// matches the layout we'd write, we can skip the SD-erase warning and
+/// flash_image will skip the full erase + GPT rewrite.
+pub fn probe_sd_full() -> Result<SdProbe> {
     let mut device = open_single()?;
     device.switch_storage(StorageIndex::Sd)?;
     let info = device.flash_info()?;
-    Ok(info.size())
+    let total_bytes = info.size();
+    let total_sectors = info.sectors() as u64;
+    let mut io = device.into_io()?;
+    let existing = crate::flash::read_existing_layout(&mut io);
+    Ok(SdProbe {
+        total_bytes,
+        total_sectors,
+        existing,
+    })
+}
+
+#[derive(Debug, Clone)]
+pub struct SdProbe {
+    pub total_bytes: u64,
+    pub total_sectors: u64,
+    pub existing: Option<crate::flash::Layout>,
 }

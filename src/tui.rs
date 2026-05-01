@@ -39,16 +39,26 @@ struct App {
     flashing: Arc<Mutex<bool>>,
     devices: Vec<device::DeviceSummary>,
     device_err: Option<String>,
+    sd_total_sectors: Option<u64>,
     sd_total_bytes: Option<u64>,
+    sd_existing: Option<flash::Layout>,
     flash_result: Arc<Mutex<Option<Result<(), String>>>>,
     success_banner: bool,
     reset_after_flash: bool,
     userdata_magic: bool,
-    /// When Some, render the centered confirm dialog. Holds the Config that
-    /// will be used if the user confirms (so we don't re-validate).
-    pending_confirm: Option<Config>,
+    /// When Some, render the centered confirm dialog.
+    pending_confirm: Option<PendingConfirm>,
     /// When Some, render a red error overlay. Any key dismisses it.
     error_msg: Option<String>,
+}
+
+/// What's queued behind the confirm dialog: the validated Config, plus
+/// whether the existing on-disk GPT already matches — used to drop the
+/// SD-erase warning when nothing destructive is going to happen to
+/// rootfs_b / userdata.
+struct PendingConfirm {
+    cfg: Config,
+    layout_matches: bool,
 }
 
 pub fn run() -> Result<()> {
@@ -57,14 +67,20 @@ pub fn run() -> Result<()> {
         Ok(d) => (d, None),
         Err(e) => (Vec::new(), Some(e.to_string())),
     };
-    let (sd_total_bytes, probe_err) = match device::probe_sd_size() {
-        Ok(s) => (Some(s), None),
-        Err(e) => (None, Some(e.to_string())),
-    };
+    let (sd_total_bytes, sd_total_sectors, sd_existing, probe_err) =
+        match device::probe_sd_full() {
+            Ok(p) => (Some(p.total_bytes), Some(p.total_sectors), p.existing, None),
+            Err(e) => (None, None, None, Some(e.to_string())),
+        };
 
     let mut log: Vec<String> = Vec::new();
     if let Some(s) = sd_total_bytes {
         log.push(format!("SD capacity: {} MiB", s / (1024 * 1024)));
+        if sd_existing.is_some() {
+            log.push(
+                "Existing leaflash partition table detected on SD.".to_string(),
+            );
+        }
     } else if let Some(e) = probe_err {
         log.push(format!("Could not probe SD capacity: {e}"));
     }
@@ -79,7 +95,9 @@ pub fn run() -> Result<()> {
         flashing: Arc::new(Mutex::new(false)),
         devices,
         device_err,
+        sd_total_sectors,
         sd_total_bytes,
+        sd_existing,
         flash_result: Arc::new(Mutex::new(None)),
         success_banner: false,
         reset_after_flash: true,
@@ -233,8 +251,8 @@ fn handle_event(app: &mut App, evt: &Event) -> Result<Tick> {
 fn handle_confirm_key(app: &mut App, key: &crossterm::event::KeyEvent) -> Result<Tick> {
     match key.code {
         KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-            let cfg = app.pending_confirm.take().expect("checked above");
-            kickoff_flash(app, cfg);
+            let pc = app.pending_confirm.take().expect("checked above");
+            kickoff_flash(app, pc.cfg);
         }
         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => {
             app.pending_confirm = None;
@@ -243,14 +261,14 @@ fn handle_confirm_key(app: &mut App, key: &crossterm::event::KeyEvent) -> Result
             // Toggle reset preference and update the held config so the
             // dialog re-renders with the new value.
             app.reset_after_flash = !app.reset_after_flash;
-            if let Some(cfg) = app.pending_confirm.as_mut() {
-                cfg.reset_after_flash = app.reset_after_flash;
+            if let Some(pc) = app.pending_confirm.as_mut() {
+                pc.cfg.reset_after_flash = app.reset_after_flash;
             }
         }
         KeyCode::Char('m') | KeyCode::Char('M') => {
             app.userdata_magic = !app.userdata_magic;
-            if let Some(cfg) = app.pending_confirm.as_mut() {
-                cfg.userdata_magic = app.userdata_magic;
+            if let Some(pc) = app.pending_confirm.as_mut() {
+                pc.cfg.userdata_magic = app.userdata_magic;
             }
         }
         _ => {}
@@ -335,12 +353,22 @@ fn open_confirmation(app: &mut App) -> Result<()> {
         }
     }
 
-    app.pending_confirm = Some(Config {
+    let cfg = Config {
         image,
         rootfs_size_bytes: size_bytes,
         reset_after_flash: app.reset_after_flash,
         userdata_magic: app.userdata_magic,
-    });
+    };
+    let layout_matches = match (app.sd_total_sectors, app.sd_existing) {
+        (Some(total_sectors), Some(existing)) => {
+            flash::expected_layout(total_sectors, size_bytes)
+                .ok()
+                .map(|exp| exp == existing)
+                .unwrap_or(false)
+        }
+        _ => false,
+    };
+    app.pending_confirm = Some(PendingConfirm { cfg, layout_matches });
     Ok(())
 }
 
@@ -428,8 +456,8 @@ fn draw(f: &mut ratatui::Frame<'_>, app: &App) {
     draw_log(f, app, chunks[4]);
 
     // Overlays in priority order (last drawn = on top)
-    if let Some(cfg) = &app.pending_confirm {
-        draw_confirm_overlay(f, app, cfg, f.area());
+    if let Some(pc) = &app.pending_confirm {
+        draw_confirm_overlay(f, app, pc, f.area());
     }
     if app.success_banner {
         draw_success_overlay(f, app, f.area());
@@ -614,7 +642,8 @@ fn draw_error_overlay(f: &mut ratatui::Frame<'_>, msg: &str, area: Rect) {
     f.render_widget(p, popup);
 }
 
-fn draw_confirm_overlay(f: &mut ratatui::Frame<'_>, app: &App, cfg: &Config, area: Rect) {
+fn draw_confirm_overlay(f: &mut ratatui::Frame<'_>, app: &App, pc: &PendingConfirm, area: Rect) {
+    let cfg = &pc.cfg;
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(Span::styled(
         "Confirm flash",
@@ -661,14 +690,26 @@ fn draw_confirm_overlay(f: &mut ratatui::Frame<'_>, app: &App, cfg: &Config, are
         if cfg.userdata_magic { "ON".to_string() } else { "off".to_string() },
     );
     // Warnings come BEFORE the key-hint line so they survive any height
-    // clamping the terminal forces on us. The SD-erase warning is shown
-    // unconditionally; the userdata warning is added on top of it when
-    // userdata-magic is on.
+    // clamping the terminal forces on us.
+    //
+    // - SD-erase warning: shown unless the device already has the exact
+    //   GPT we'd write. In that case flash_image will only refresh
+    //   rootfs_a, leaving rootfs_b and userdata intact.
+    // - userdata-magic warning: shown whenever the user enabled magic,
+    //   regardless of layout-match — userdata gets wiped at next boot
+    //   either way.
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "WARNING: this erases the entire SD card.",
-        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-    )));
+    if pc.layout_matches {
+        lines.push(Line::from(Span::styled(
+            "Existing GPT matches: rootfs_b and userdata will be preserved; rootfs_a refreshed.",
+            Style::default().fg(Color::Green),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "WARNING: this erases the entire SD card.",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )));
+    }
     if cfg.userdata_magic {
         lines.push(Line::from(Span::styled(
             "WARNING: userdata-magic is ON — userdata will be auto-wiped on next boot.",
