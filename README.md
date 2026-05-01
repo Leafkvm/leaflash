@@ -1,5 +1,7 @@
 # leaflash
 
+![leaflash](./leaflash-main.png)
+
 Development CLI for the [LeafKVM](https://www.crowdsupply.com/leafkvm/leafkvm) device.
 
 ```text
