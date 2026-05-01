@@ -660,11 +660,11 @@ fn draw_confirm_overlay(f: &mut ratatui::Frame<'_>, app: &App, cfg: &Config, are
         "userdata-magic",
         if cfg.userdata_magic { "ON".to_string() } else { "off".to_string() },
     );
+    // Warnings come BEFORE the key-hint line so they survive any height
+    // clamping the terminal forces on us. The SD-erase warning is shown
+    // unconditionally; the userdata warning is added on top of it when
+    // userdata-magic is on.
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "[y/Enter] confirm   [n/Esc] cancel   [r] toggle reset   [m] toggle userdata-magic",
-        Style::default().fg(Color::DarkGray),
-    )));
     lines.push(Line::from(Span::styled(
         "WARNING: this erases the entire SD card.",
         Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
@@ -675,6 +675,11 @@ fn draw_confirm_overlay(f: &mut ratatui::Frame<'_>, app: &App, cfg: &Config, are
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         )));
     }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "[y/Enter] confirm  [n/Esc] cancel  [r] reset  [m] magic",
+        Style::default().fg(Color::DarkGray),
+    )));
 
     let h = (lines.len() as u16 + 2).min(area.height.saturating_sub(2));
     let w = 70u16.min(area.width.saturating_sub(4));
