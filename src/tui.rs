@@ -18,7 +18,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui_explorer::FileExplorer;
 
 use crate::device;
-use crate::flash::{self, Config, ProgressHandle, Report};
+use crate::flash::{self, Config, Partition, ProgressHandle, Report};
 
 const SECTOR_SIZE: u64 = flash::SECTOR_SIZE;
 
@@ -46,6 +46,7 @@ struct App {
     success_banner: bool,
     reset_after_flash: bool,
     userdata_magic: bool,
+    target_partition: Partition,
     /// When Some, render the centered confirm dialog.
     pending_confirm: Option<PendingConfirm>,
     /// When Some, render a red error overlay. Any key dismisses it.
@@ -102,6 +103,7 @@ pub fn run() -> Result<()> {
         success_banner: false,
         reset_after_flash: true,
         userdata_magic: false,
+        target_partition: Partition::RootfsA,
         pending_confirm: None,
         error_msg: None,
     };
@@ -219,6 +221,13 @@ fn handle_event(app: &mut App, evt: &Event) -> Result<Tick> {
             app.userdata_magic = !app.userdata_magic;
             return Ok(Tick::Continue);
         }
+        KeyCode::Char('p') if app.focus != Focus::Size => {
+            app.target_partition = match app.target_partition {
+                Partition::RootfsA => Partition::RootfsB,
+                Partition::RootfsB => Partition::RootfsA,
+            };
+            return Ok(Tick::Continue);
+        }
         _ => {}
     }
 
@@ -269,6 +278,15 @@ fn handle_confirm_key(app: &mut App, key: &crossterm::event::KeyEvent) -> Result
             app.userdata_magic = !app.userdata_magic;
             if let Some(pc) = app.pending_confirm.as_mut() {
                 pc.cfg.userdata_magic = app.userdata_magic;
+            }
+        }
+        KeyCode::Char('p') | KeyCode::Char('P') => {
+            app.target_partition = match app.target_partition {
+                Partition::RootfsA => Partition::RootfsB,
+                Partition::RootfsB => Partition::RootfsA,
+            };
+            if let Some(pc) = app.pending_confirm.as_mut() {
+                pc.cfg.target_partition = app.target_partition;
             }
         }
         _ => {}
@@ -358,6 +376,7 @@ fn open_confirmation(app: &mut App) -> Result<()> {
         rootfs_size_bytes: size_bytes,
         reset_after_flash: app.reset_after_flash,
         userdata_magic: app.userdata_magic,
+        target_partition: app.target_partition,
     };
     let layout_matches = match (app.sd_total_sectors, app.sd_existing) {
         (Some(total_sectors), Some(existing)) => {
@@ -379,8 +398,12 @@ fn kickoff_flash(app: &mut App, cfg: Config) {
     let result_slot = app.flash_result.clone();
 
     log.lock().unwrap().push(format!(
-        "Starting flash: image={} rootfs_size={} bytes reset={} userdata_magic={}",
-        cfg.image.display(), cfg.rootfs_size_bytes, cfg.reset_after_flash, cfg.userdata_magic,
+        "Starting flash: image={} target={} rootfs_size={} bytes reset={} userdata_magic={}",
+        cfg.image.display(),
+        cfg.target_partition,
+        cfg.rootfs_size_bytes,
+        cfg.reset_after_flash,
+        cfg.userdata_magic,
     ));
 
     thread::spawn(move || {
@@ -516,7 +539,7 @@ fn draw_devices(f: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
     let p = Paragraph::new(lines).block(
         Block::default()
             .borders(Borders::ALL)
-            .title("Devices  (Tab cycles · q/Esc/Ctrl-C quits · r=reset · m=userdata-magic)"),
+            .title("Devices  (Tab cycles · q/Esc/Ctrl-C quits · r=reset · m=magic · p=partition)"),
     );
     f.render_widget(p, area);
 }
@@ -561,7 +584,8 @@ fn draw_button(f: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
         Style::default().add_modifier(Modifier::BOLD)
     };
     let title = format!(
-        "Flash (Enter)  ·  reset(r): {}  ·  userdata-magic(m): {}",
+        "Flash (Enter)  ·  target(p): {}  ·  reset(r): {}  ·  magic(m): {}",
+        app.target_partition,
         if app.reset_after_flash { "ON" } else { "off" },
         if app.userdata_magic { "ON" } else { "off" },
     );
@@ -663,6 +687,7 @@ fn draw_confirm_overlay(f: &mut ratatui::Frame<'_>, app: &App, pc: &PendingConfi
     if let Ok(meta) = std::fs::metadata(&cfg.image) {
         push(&mut lines, "image size", format!("{} MiB ({} bytes)", meta.len() / mib, meta.len()));
     }
+    push(&mut lines, "target partition", cfg.target_partition.to_string());
     push(&mut lines, "rootfs A size", format!("{} MiB", cfg.rootfs_size_bytes / mib));
     push(&mut lines, "rootfs B size", format!("{} MiB", cfg.rootfs_size_bytes / mib));
     let userdata_estimate = app.sd_total_bytes.map(|t| {
@@ -700,8 +725,15 @@ fn draw_confirm_overlay(f: &mut ratatui::Frame<'_>, app: &App, pc: &PendingConfi
     //   either way.
     lines.push(Line::from(""));
     if pc.layout_matches {
+        let other = match cfg.target_partition {
+            Partition::RootfsA => "rootfs_b",
+            Partition::RootfsB => "rootfs_a",
+        };
         lines.push(Line::from(Span::styled(
-            "Existing GPT matches: rootfs_b and userdata will be preserved; rootfs_a refreshed.",
+            format!(
+                "Existing GPT matches: only {} will be erased + rewritten; {} and userdata preserved.",
+                cfg.target_partition, other,
+            ),
             Style::default().fg(Color::Green),
         )));
     } else {
@@ -718,7 +750,7 @@ fn draw_confirm_overlay(f: &mut ratatui::Frame<'_>, app: &App, pc: &PendingConfi
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "[y/Enter] confirm  [n/Esc] cancel  [r] reset  [m] magic",
+        "[y/Enter] confirm  [n/Esc] cancel  [p] target  [r] reset  [m] magic",
         Style::default().fg(Color::DarkGray),
     )));
 

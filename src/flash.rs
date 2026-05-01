@@ -34,6 +34,31 @@ pub const GPT_OVERHEAD_BYTES: u64 = 4 * 1024 * 1024;
 /// detect a "first boot after flash" state and wipe userdata automatically.
 pub const USERDATA_MAGIC: &[u8; 20] = b"LEAFKVMUSERDATAMAGIC";
 
+/// Which slot to write the image into. A/B systems usually flash the
+/// inactive slot and let the bootloader switch over after reboot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum Partition {
+    #[value(name = "rootfs_a")]
+    RootfsA,
+    #[value(name = "rootfs_b")]
+    RootfsB,
+}
+
+impl Partition {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Partition::RootfsA => "rootfs_a",
+            Partition::RootfsB => "rootfs_b",
+        }
+    }
+}
+
+impl std::fmt::Display for Partition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
 /// Largest single rootfs (A == B) that fits on a card of the given total size,
 /// leaving GPT overhead and zero bytes for userdata. Anything larger is invalid.
 pub fn max_rootfs_bytes(total_storage_bytes: u64) -> u64 {
@@ -52,6 +77,16 @@ pub struct Layout {
     pub b_end: u64,
     pub user_start: u64,
     pub user_end: u64,
+}
+
+impl Layout {
+    /// (start_lba, end_lba) for the chosen rootfs slot.
+    pub fn target_range(&self, p: Partition) -> (u64, u64) {
+        match p {
+            Partition::RootfsA => (self.a_start, self.a_end),
+            Partition::RootfsB => (self.b_start, self.b_end),
+        }
+    }
 }
 
 // gptman 1.x defaults: 128 partition entries (32 sectors), 1 MiB alignment.
@@ -126,6 +161,9 @@ pub struct FlashArgs {
     /// bootloader asks the user to confirm before wiping.
     #[arg(long, default_value_t = false)]
     pub userdata_magic: bool,
+    /// Target partition slot to write the image into.
+    #[arg(long, value_enum, default_value_t = Partition::RootfsA)]
+    pub partition: Partition,
 }
 
 /// All inputs to `flash_image`. Add fields here instead of widening the
@@ -136,6 +174,7 @@ pub struct Config {
     pub rootfs_size_bytes: u64,
     pub reset_after_flash: bool,
     pub userdata_magic: bool,
+    pub target_partition: Partition,
 }
 
 impl From<&FlashArgs> for Config {
@@ -145,6 +184,7 @@ impl From<&FlashArgs> for Config {
             rootfs_size_bytes: a.rootfs_size,
             reset_after_flash: a.reset_after_flash,
             userdata_magic: a.userdata_magic,
+            target_partition: a.partition,
         }
     }
 }
@@ -298,13 +338,17 @@ pub fn flash_image(
     let preserve = existing == Some(layout);
     let mut device = io.into_inner();
 
+    let (target_start, target_end) = layout.target_range(cfg.target_partition);
+    let target_name = cfg.target_partition.name();
+
     if preserve {
-        report.stage(
-            "Existing GPT matches; preserving rootfs_b and userdata, refreshing rootfs_a only.",
-        );
-        let a_count = layout.a_end - layout.a_start + 1;
-        let mut bar = report.progress_begin(a_count, "Erasing rootfs_a...");
-        chunk_erase(&mut device, layout.a_start as u32, a_count as u32, &mut *bar)?;
+        report.stage(&format!(
+            "Existing GPT matches; only refreshing {} (other partitions left intact).",
+            target_name,
+        ));
+        let target_count = target_end - target_start + 1;
+        let mut bar = report.progress_begin(target_count, &format!("Erasing {}...", target_name));
+        chunk_erase(&mut device, target_start as u32, target_count as u32, &mut *bar)?;
         bar.finish();
     } else {
         report.stage(&format!(
@@ -323,12 +367,25 @@ pub fn flash_image(
     if !preserve {
         report.stage("Generating GPT (rootfs_a / rootfs_b / userdata)...");
         let mut gpt = GPT::new_from(&mut io, SECTOR_SIZE, random_guid())?;
+        // Mark only the slot we're flashing as legacy-bootable. Most rockchip
+        // bootloaders ignore this bit, but if anything reads GPT it'll see
+        // the chosen slot as the boot target.
+        let a_bits = if matches!(cfg.target_partition, Partition::RootfsA) {
+            ATTR_LEGACY_BIOS_BOOTABLE
+        } else {
+            0
+        };
+        let b_bits = if matches!(cfg.target_partition, Partition::RootfsB) {
+            ATTR_LEGACY_BIOS_BOOTABLE
+        } else {
+            0
+        };
         gpt[1] = GPTPartitionEntry {
             partition_type_guid: LINUX_FS_GUID,
             unique_partition_guid: random_guid(),
             starting_lba: layout.a_start,
             ending_lba: layout.a_end,
-            attribute_bits: ATTR_LEGACY_BIOS_BOOTABLE,
+            attribute_bits: a_bits,
             partition_name: "rootfs_a".into(),
         };
         gpt[2] = GPTPartitionEntry {
@@ -336,7 +393,7 @@ pub fn flash_image(
             unique_partition_guid: random_guid(),
             starting_lba: layout.b_start,
             ending_lba: layout.b_end,
-            attribute_bits: 0,
+            attribute_bits: b_bits,
             partition_name: "rootfs_b".into(),
         };
         gpt[3] = GPTPartitionEntry {
@@ -368,12 +425,13 @@ pub fn flash_image(
     }
 
     report.stage(&format!(
-        "Writing image {} -> rootfs_a (LBA {})...",
+        "Writing image {} -> {} (LBA {})...",
         cfg.image.display(),
-        layout.a_start,
+        target_name,
+        target_start,
     ));
     let mut img = File::open(&cfg.image)?;
-    io.seek(SeekFrom::Start(layout.a_start * SECTOR_SIZE))?;
+    io.seek(SeekFrom::Start(target_start * SECTOR_SIZE))?;
     let mut bar = report.progress_begin(img_len, "Writing image...");
     let mut buf = vec![0u8; 1024 * 1024];
     loop {
