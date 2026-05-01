@@ -29,6 +29,11 @@ pub const DEFAULT_ROUND_MIB: u64 = 128;
 /// 4 MiB is comfortably more than the standard ~67 sectors actually used.
 pub const GPT_OVERHEAD_BYTES: u64 = 4 * 1024 * 1024;
 
+/// 20-byte ASCII marker. When `--userdata-magic` is set we write it at the
+/// first and last 20 bytes of the userdata partition so the bootloader can
+/// detect a "first boot after flash" state and wipe userdata automatically.
+pub const USERDATA_MAGIC: &[u8; 20] = b"LEAFKVMUSERDATAMAGIC";
+
 /// Largest single rootfs (A == B) that fits on a card of the given total size,
 /// leaving GPT overhead and zero bytes for userdata. Anything larger is invalid.
 pub fn max_rootfs_bytes(total_storage_bytes: u64) -> u64 {
@@ -46,6 +51,12 @@ pub struct FlashArgs {
     /// Reset the device after the image is written (boots into the new image)
     #[arg(long, default_value_t = false)]
     pub reset_after_flash: bool,
+    /// Write LEAFKVMUSERDATAMAGIC at the start and end of the userdata
+    /// partition. Bootloader treats this as a "first boot after flash"
+    /// signal and wipes userdata automatically — without it, the
+    /// bootloader asks the user to confirm before wiping.
+    #[arg(long, default_value_t = false)]
+    pub userdata_magic: bool,
 }
 
 /// All inputs to `flash_image`. Add fields here instead of widening the
@@ -55,6 +66,7 @@ pub struct Config {
     pub image: PathBuf,
     pub rootfs_size_bytes: u64,
     pub reset_after_flash: bool,
+    pub userdata_magic: bool,
 }
 
 impl From<&FlashArgs> for Config {
@@ -63,6 +75,7 @@ impl From<&FlashArgs> for Config {
             image: a.image.clone(),
             rootfs_size_bytes: a.rootfs_size,
             reset_after_flash: a.reset_after_flash,
+            userdata_magic: a.userdata_magic,
         }
     }
 }
@@ -295,6 +308,23 @@ pub fn flash_image(
     }
     io.flush()?;
     bar.finish();
+
+    if cfg.userdata_magic {
+        report.stage(
+            "Writing userdata magic markers (bootloader will auto-wipe userdata on next boot)...",
+        );
+        let userdata_first_byte = user_start * SECTOR_SIZE;
+        let userdata_last_byte = (user_end + 1) * SECTOR_SIZE;
+        let trailing_offset = userdata_last_byte - USERDATA_MAGIC.len() as u64;
+
+        io.seek(SeekFrom::Start(userdata_first_byte))?;
+        io.write_all(USERDATA_MAGIC)?;
+
+        io.seek(SeekFrom::Start(trailing_offset))?;
+        io.write_all(USERDATA_MAGIC)?;
+
+        io.flush()?;
+    }
 
     if cfg.reset_after_flash {
         report.stage("Resetting device...");

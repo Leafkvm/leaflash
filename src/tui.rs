@@ -43,6 +43,7 @@ struct App {
     flash_result: Arc<Mutex<Option<Result<(), String>>>>,
     success_banner: bool,
     reset_after_flash: bool,
+    userdata_magic: bool,
     /// When Some, render the centered confirm dialog. Holds the Config that
     /// will be used if the user confirms (so we don't re-validate).
     pending_confirm: Option<Config>,
@@ -82,6 +83,7 @@ pub fn run() -> Result<()> {
         flash_result: Arc::new(Mutex::new(None)),
         success_banner: false,
         reset_after_flash: true,
+        userdata_magic: false,
         pending_confirm: None,
         error_msg: None,
     };
@@ -195,6 +197,10 @@ fn handle_event(app: &mut App, evt: &Event) -> Result<Tick> {
             app.reset_after_flash = !app.reset_after_flash;
             return Ok(Tick::Continue);
         }
+        KeyCode::Char('m') if app.focus != Focus::Size => {
+            app.userdata_magic = !app.userdata_magic;
+            return Ok(Tick::Continue);
+        }
         _ => {}
     }
 
@@ -239,6 +245,12 @@ fn handle_confirm_key(app: &mut App, key: &crossterm::event::KeyEvent) -> Result
             app.reset_after_flash = !app.reset_after_flash;
             if let Some(cfg) = app.pending_confirm.as_mut() {
                 cfg.reset_after_flash = app.reset_after_flash;
+            }
+        }
+        KeyCode::Char('m') | KeyCode::Char('M') => {
+            app.userdata_magic = !app.userdata_magic;
+            if let Some(cfg) = app.pending_confirm.as_mut() {
+                cfg.userdata_magic = app.userdata_magic;
             }
         }
         _ => {}
@@ -327,6 +339,7 @@ fn open_confirmation(app: &mut App) -> Result<()> {
         image,
         rootfs_size_bytes: size_bytes,
         reset_after_flash: app.reset_after_flash,
+        userdata_magic: app.userdata_magic,
     });
     Ok(())
 }
@@ -338,8 +351,8 @@ fn kickoff_flash(app: &mut App, cfg: Config) {
     let result_slot = app.flash_result.clone();
 
     log.lock().unwrap().push(format!(
-        "Starting flash: image={} rootfs_size={} bytes reset={}",
-        cfg.image.display(), cfg.rootfs_size_bytes, cfg.reset_after_flash,
+        "Starting flash: image={} rootfs_size={} bytes reset={} userdata_magic={}",
+        cfg.image.display(), cfg.rootfs_size_bytes, cfg.reset_after_flash, cfg.userdata_magic,
     ));
 
     thread::spawn(move || {
@@ -438,6 +451,9 @@ fn devices_line_count(app: &App) -> u16 {
     if app.sd_total_bytes.is_some() {
         n += 1;
     }
+    if app.userdata_magic {
+        n += 1;
+    }
     n.max(1)
 }
 
@@ -463,10 +479,16 @@ fn draw_devices(f: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
         lines.push(Line::from(format!("SD: {} MiB", s / (1024 * 1024))));
     }
 
+    if app.userdata_magic {
+        lines.push(Line::from(Span::styled(
+            "WARNING: userdata-magic ON — userdata will be auto-wiped on next boot.",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )));
+    }
     let p = Paragraph::new(lines).block(
         Block::default()
             .borders(Borders::ALL)
-            .title("Devices  (Tab cycles · q/Esc/Ctrl-C quits · r toggles reset-after-flash)"),
+            .title("Devices  (Tab cycles · q/Esc/Ctrl-C quits · r=reset · m=userdata-magic)"),
     );
     f.render_widget(p, area);
 }
@@ -511,8 +533,9 @@ fn draw_button(f: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
         Style::default().add_modifier(Modifier::BOLD)
     };
     let title = format!(
-        "Flash (Enter)  ·  reset-after-flash: {}  (press r to toggle)",
-        if app.reset_after_flash { "ON" } else { "off" }
+        "Flash (Enter)  ·  reset(r): {}  ·  userdata-magic(m): {}",
+        if app.reset_after_flash { "ON" } else { "off" },
+        if app.userdata_magic { "ON" } else { "off" },
     );
     let p = Paragraph::new(Span::styled(label, style)).block(
         Block::default()
@@ -632,15 +655,26 @@ fn draw_confirm_overlay(f: &mut ratatui::Frame<'_>, app: &App, cfg: &Config, are
         "reset-after-flash",
         if cfg.reset_after_flash { "ON".to_string() } else { "off".to_string() },
     );
+    push(
+        &mut lines,
+        "userdata-magic",
+        if cfg.userdata_magic { "ON".to_string() } else { "off".to_string() },
+    );
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "[y/Enter] confirm    [n/Esc] cancel    [r] toggle reset-after-flash",
+        "[y/Enter] confirm   [n/Esc] cancel   [r] toggle reset   [m] toggle userdata-magic",
         Style::default().fg(Color::DarkGray),
     )));
     lines.push(Line::from(Span::styled(
         "WARNING: this erases the entire SD card.",
         Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
     )));
+    if cfg.userdata_magic {
+        lines.push(Line::from(Span::styled(
+            "WARNING: userdata-magic is ON — userdata will be auto-wiped on next boot.",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )));
+    }
 
     let h = (lines.len() as u16 + 2).min(area.height.saturating_sub(2));
     let w = 70u16.min(area.width.saturating_sub(4));
