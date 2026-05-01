@@ -39,6 +39,9 @@ struct App {
     flashing: Arc<Mutex<bool>>,
     devices: Vec<device::DeviceSummary>,
     device_err: Option<String>,
+    /// Index into `devices` of the device the next probe / flash will
+    /// target. Stays at 0 when only one device is attached.
+    selected_device: usize,
     sd_total_sectors: Option<u64>,
     sd_total_bytes: Option<u64>,
     sd_existing: Option<flash::Layout>,
@@ -70,41 +73,20 @@ struct PendingConfirm {
 
 pub fn run() -> Result<()> {
     let explorer = FileExplorer::new()?;
-    let (devices, device_err) = match device::list() {
-        Ok(d) => (d, None),
-        Err(e) => (Vec::new(), Some(e.to_string())),
-    };
-    let (sd_total_bytes, sd_total_sectors, sd_existing, probe_err) =
-        match device::probe_sd_full() {
-            Ok(p) => (Some(p.total_bytes), Some(p.total_sectors), p.existing, None),
-            Err(e) => (None, None, None, Some(e.to_string())),
-        };
-
-    let mut log: Vec<String> = Vec::new();
-    if let Some(s) = sd_total_bytes {
-        log.push(format!("SD capacity: {} MiB", s / (1024 * 1024)));
-        if sd_existing.is_some() {
-            log.push(
-                "Existing leaflash partition table detected on SD.".to_string(),
-            );
-        }
-    } else if let Some(e) = probe_err {
-        log.push(format!("Could not probe SD capacity: {e}"));
-    }
-
     let mut app = App {
         explorer,
         selected_image: None,
         size_input: "256MiB".to_string(),
         focus: Focus::Picker,
-        log: Arc::new(Mutex::new(log)),
+        log: Arc::new(Mutex::new(Vec::new())),
         progress: Arc::new(Mutex::new(None)),
         flashing: Arc::new(Mutex::new(false)),
-        devices,
-        device_err,
-        sd_total_sectors,
-        sd_total_bytes,
-        sd_existing,
+        devices: Vec::new(),
+        device_err: None,
+        selected_device: 0,
+        sd_total_sectors: None,
+        sd_total_bytes: None,
+        sd_existing: None,
         flash_result: Arc::new(Mutex::new(None)),
         success_banner: false,
         reset_after_flash: true,
@@ -113,6 +95,7 @@ pub fn run() -> Result<()> {
         pending_confirm: None,
         error_msg: None,
     };
+    refresh_devices(&mut app);
 
     let mut terminal = setup_terminal()?;
     let res = event_loop(&mut terminal, &mut app);
@@ -219,7 +202,7 @@ fn handle_event(app: &mut App, evt: &Event) -> Result<Tick> {
             };
             return Ok(Tick::Continue);
         }
-        KeyCode::Char('r') if app.focus != Focus::Size => {
+        KeyCode::Char('b') if app.focus != Focus::Size => {
             app.reset_after_flash = !app.reset_after_flash;
             return Ok(Tick::Continue);
         }
@@ -232,6 +215,18 @@ fn handle_event(app: &mut App, evt: &Event) -> Result<Tick> {
                 Partition::RootfsA => Partition::RootfsB,
                 Partition::RootfsB => Partition::RootfsA,
             };
+            return Ok(Tick::Continue);
+        }
+        KeyCode::Char('r') if app.focus != Focus::Size => {
+            refresh_devices(app);
+            return Ok(Tick::Continue);
+        }
+        KeyCode::Char(c @ '1'..='9') if app.focus != Focus::Size => {
+            let idx = (c as u8 - b'1') as usize;
+            if idx < app.devices.len() && idx != app.selected_device {
+                app.selected_device = idx;
+                reprobe_selected(app);
+            }
             return Ok(Tick::Continue);
         }
         _ => {}
@@ -272,7 +267,7 @@ fn handle_confirm_key(app: &mut App, key: &crossterm::event::KeyEvent) -> Result
         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => {
             app.pending_confirm = None;
         }
-        KeyCode::Char('r') | KeyCode::Char('R') => {
+        KeyCode::Char('b') | KeyCode::Char('B') => {
             // Toggle reset preference and update the held config so the
             // dialog re-renders with the new value.
             app.reset_after_flash = !app.reset_after_flash;
@@ -416,13 +411,22 @@ fn open_confirmation(app: &mut App) -> Result<()> {
 }
 
 fn kickoff_flash(app: &mut App, cfg: Config) {
+    let Some(dev_summary) = app.devices.get(app.selected_device).copied() else {
+        app.error_msg = Some("No device selected".to_string());
+        return;
+    };
+    let bus = dev_summary.bus;
+    let address = dev_summary.address;
+
     *app.flashing.lock().unwrap() = true;
     let log = app.log.clone();
     let progress = app.progress.clone();
     let result_slot = app.flash_result.clone();
 
     log.lock().unwrap().push(format!(
-        "Starting flash: image={} target={} rootfs_size={} bytes reset={} userdata_magic={}",
+        "Starting flash: device={}:{} image={} target={} rootfs_size={} bytes reset={} userdata_magic={}",
+        bus,
+        address,
         cfg.image.display(),
         cfg.target_partition,
         cfg.rootfs_size_bytes,
@@ -433,12 +437,70 @@ fn kickoff_flash(app: &mut App, cfg: Config) {
     thread::spawn(move || {
         let report = TuiReport { log: log.clone(), progress: progress.clone() };
         let res: Result<()> = (|| {
-            let dev = device::open_single()?;
+            let dev = device::open_at(bus, address)?;
             flash::flash_image(dev, &cfg, &report)?;
             Ok(())
         })();
         *result_slot.lock().unwrap() = Some(res.map_err(|e| e.to_string()));
     });
+}
+
+/// Re-list RockUSB devices and re-probe the SD on whichever one is now
+/// selected. Bound to `r` at the top level.
+fn refresh_devices(app: &mut App) {
+    match device::list() {
+        Ok(d) => {
+            app.devices = d;
+            app.device_err = None;
+        }
+        Err(e) => {
+            app.devices = Vec::new();
+            app.device_err = Some(e.to_string());
+        }
+    }
+    if app.selected_device >= app.devices.len() {
+        app.selected_device = 0;
+    }
+    reprobe_selected(app);
+    let n = app.devices.len();
+    app.log.lock().unwrap().push(format!(
+        "Refreshed: {} RockUSB device{} found",
+        n,
+        if n == 1 { "" } else { "s" },
+    ));
+}
+
+fn reprobe_selected(app: &mut App) {
+    app.sd_total_bytes = None;
+    app.sd_total_sectors = None;
+    app.sd_existing = None;
+    let Some(d) = app.devices.get(app.selected_device).copied() else {
+        return;
+    };
+    match device::probe_sd_full_at(d.bus, d.address) {
+        Ok(p) => {
+            app.sd_total_bytes = Some(p.total_bytes);
+            app.sd_total_sectors = Some(p.total_sectors);
+            app.sd_existing = p.existing;
+            app.log.lock().unwrap().push(format!(
+                "Probed device {}:{}: SD {} MiB{}",
+                d.bus,
+                d.address,
+                p.total_bytes / (1024 * 1024),
+                if p.existing.is_some() {
+                    " (existing leaflash GPT)"
+                } else {
+                    ""
+                },
+            ));
+        }
+        Err(e) => {
+            app.log
+                .lock()
+                .unwrap()
+                .push(format!("Could not probe device {}:{}: {e}", d.bus, d.address));
+        }
+    }
 }
 
 struct TuiReport {
@@ -542,12 +604,26 @@ fn draw_devices(f: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
     } else if app.devices.is_empty() {
         lines.push(Line::from("No RockUSB devices found"));
     } else {
-        for d in &app.devices {
+        for (i, d) in app.devices.iter().enumerate() {
+            let selected = i == app.selected_device;
+            let marker = if selected { ">" } else { " " };
             let status = if d.available { "ok" } else { "unavailable" };
-            lines.push(Line::from(format!(
-                "RockUSB bus {} addr {} ({status})",
-                d.bus, d.address
-            )));
+            let label = format!(
+                "{} {}) RockUSB bus {} addr {} ({})",
+                marker,
+                i + 1,
+                d.bus,
+                d.address,
+                status
+            );
+            let style = if selected {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            lines.push(Line::from(Span::styled(label, style)));
         }
     }
     if let Some(s) = app.sd_total_bytes {
@@ -563,7 +639,9 @@ fn draw_devices(f: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
     let p = Paragraph::new(lines).block(
         Block::default()
             .borders(Borders::ALL)
-            .title("Devices  (Tab cycles · q/Esc/Ctrl-C quits · r=reset · m=magic · p=partition)"),
+            .title(
+                "Devices  (Tab cycles · q/Esc/Ctrl-C quits · r=refresh · 1-9=select · b=reboot · m=magic · p=partition)",
+            ),
     );
     f.render_widget(p, area);
 }
@@ -608,7 +686,7 @@ fn draw_button(f: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
         Style::default().add_modifier(Modifier::BOLD)
     };
     let title = format!(
-        "Flash (Enter)  ·  target(p): {}  ·  reset(r): {}  ·  magic(m): {}",
+        "Flash (Enter)  ·  target(p): {}  ·  reboot(b): {}  ·  magic(m): {}",
         app.target_partition,
         if app.reset_after_flash { "ON" } else { "off" },
         if app.userdata_magic { "ON" } else { "off" },
@@ -725,12 +803,13 @@ fn draw_confirm_overlay(f: &mut ratatui::Frame<'_>, app: &App, pc: &PendingConfi
         push(&mut lines, "SD total", format!("{} MiB", s / mib));
     }
     if !app.devices.is_empty() {
-        let d = &app.devices[0];
-        push(&mut lines, "device", format!("RockUSB bus {} addr {}", d.bus, d.address));
+        if let Some(d) = app.devices.get(app.selected_device) {
+            push(&mut lines, "device", format!("RockUSB bus {} addr {}", d.bus, d.address));
+        }
     }
     push(
         &mut lines,
-        "reset-after-flash",
+        "reboot-after-flash",
         if cfg.reset_after_flash { "ON".to_string() } else { "off".to_string() },
     );
     if cfg.userdata_magic {
@@ -783,7 +862,7 @@ fn draw_confirm_overlay(f: &mut ratatui::Frame<'_>, app: &App, pc: &PendingConfi
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "[y/Enter] confirm  [n/Esc] cancel  [p] target  [r] reset  [m] magic",
+        "[y/Enter] confirm  [n/Esc] cancel  [p] target  [b] reboot  [m] magic",
         Style::default().fg(Color::DarkGray),
     )));
 

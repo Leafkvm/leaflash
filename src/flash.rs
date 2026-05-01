@@ -146,6 +146,11 @@ where
 
 #[derive(Debug, Args, Clone)]
 pub struct FlashArgs {
+    /// Target a specific RockUSB device as <bus>:<address>. If omitted
+    /// and exactly one device is attached, that one is used; if more
+    /// than one is attached, this argument is required.
+    #[arg(short, long, value_parser = device::parse_device_addr)]
+    pub device: Option<device::DeviceAddr>,
     /// Image file to write into rootfs_a (raw, sector-aligned)
     #[arg(long)]
     pub image: PathBuf,
@@ -190,10 +195,13 @@ impl From<&FlashArgs> for Config {
 }
 
 pub fn run(args: FlashArgs) -> Result<()> {
-    let device = device::open_single()?;
+    let dev = match args.device {
+        Some(addr) => device::open_at(addr.bus, addr.address)?,
+        None => device::open_single()?,
+    };
     let report = ProgressReporter::Cli;
     let cfg = Config::from(&args);
-    flash_image(device, &cfg, &report)?;
+    flash_image(dev, &cfg, &report)?;
     println!(
         "Done.{}",
         if cfg.reset_after_flash { " Device reset." } else { "" }
