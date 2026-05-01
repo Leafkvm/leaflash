@@ -60,6 +60,12 @@ struct App {
 struct PendingConfirm {
     cfg: Config,
     layout_matches: bool,
+    /// True when userdata-magic was implicitly turned on for this flash
+    /// because the GPT layout is going to change anyway (full-erase
+    /// path), so making the bootloader auto-wipe userdata is consistent
+    /// with what we're already doing. The user can still flip 'm' to
+    /// turn it off — that clears this flag.
+    magic_auto: bool,
 }
 
 pub fn run() -> Result<()> {
@@ -275,9 +281,14 @@ fn handle_confirm_key(app: &mut App, key: &crossterm::event::KeyEvent) -> Result
             }
         }
         KeyCode::Char('m') | KeyCode::Char('M') => {
-            app.userdata_magic = !app.userdata_magic;
+            // Toggle inside the dialog flips the dialog's effective value
+            // and clears the auto-enabled flag; the app-level preference
+            // is re-synced so a later flash starts from the user's last
+            // explicit choice.
             if let Some(pc) = app.pending_confirm.as_mut() {
-                pc.cfg.userdata_magic = app.userdata_magic;
+                pc.cfg.userdata_magic = !pc.cfg.userdata_magic;
+                pc.magic_auto = false;
+                app.userdata_magic = pc.cfg.userdata_magic;
             }
         }
         KeyCode::Char('p') | KeyCode::Char('P') => {
@@ -371,7 +382,7 @@ fn open_confirmation(app: &mut App) -> Result<()> {
         }
     }
 
-    let cfg = Config {
+    let mut cfg = Config {
         image,
         rootfs_size_bytes: size_bytes,
         reset_after_flash: app.reset_after_flash,
@@ -387,7 +398,20 @@ fn open_confirmation(app: &mut App) -> Result<()> {
         }
         _ => false,
     };
-    app.pending_confirm = Some(PendingConfirm { cfg, layout_matches });
+    // If the layout is going to change (full erase + GPT rewrite path)
+    // and the user hadn't explicitly enabled userdata-magic, default it
+    // ON for this flash. Reasoning: the full erase wipes userdata
+    // anyway, so making the bootloader auto-wipe on first boot keeps
+    // first-boot prompt-free. The user can press 'm' to opt back out.
+    let magic_auto = !layout_matches && !cfg.userdata_magic;
+    if magic_auto {
+        cfg.userdata_magic = true;
+    }
+    app.pending_confirm = Some(PendingConfirm {
+        cfg,
+        layout_matches,
+        magic_auto,
+    });
     Ok(())
 }
 
@@ -709,11 +733,20 @@ fn draw_confirm_overlay(f: &mut ratatui::Frame<'_>, app: &App, pc: &PendingConfi
         "reset-after-flash",
         if cfg.reset_after_flash { "ON".to_string() } else { "off".to_string() },
     );
-    push(
-        &mut lines,
-        "userdata-magic",
-        if cfg.userdata_magic { "ON".to_string() } else { "off".to_string() },
-    );
+    if cfg.userdata_magic {
+        let value = if pc.magic_auto { "ON (GPT Layout Change)" } else { "ON" };
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {:<22}", "userdata-magic"), Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                value,
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+    } else {
+        push(&mut lines, "userdata-magic", "off".to_string());
+    }
     // Warnings come BEFORE the key-hint line so they survive any height
     // clamping the terminal forces on us.
     //
