@@ -261,6 +261,19 @@ fn start_flash(app: &mut App) -> Result<()> {
             return Ok(());
         }
     }
+    // Image vs partition check (mirrors flash_image's guard so the user sees
+    // the error before pressing Flash launches a worker thread).
+    if let Ok(meta) = std::fs::metadata(&image) {
+        if meta.len() > size_bytes {
+            app.log.lock().unwrap().push(format!(
+                "Image is {} MiB but rootfs partition is only {} MiB; pick rootfs >= {} MiB.",
+                meta.len() / (1024 * 1024),
+                size_bytes / (1024 * 1024),
+                meta.len().div_ceil(1024 * 1024),
+            ));
+            return Ok(());
+        }
+    }
 
     let cfg = Config {
         image: image.clone(),

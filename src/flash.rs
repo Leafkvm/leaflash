@@ -167,9 +167,13 @@ pub fn flash_image(
     let img_len = img_file.metadata()?.len();
     ensure!(
         img_len <= cfg.rootfs_size_bytes,
-        "image is {} bytes but rootfs partition is only {} bytes",
+        "image is {} MiB ({} bytes) but rootfs partition is {} MiB ({} bytes); \
+         pick --rootfs-size >= {} MiB",
+        img_len / (1024 * 1024),
         img_len,
-        cfg.rootfs_size_bytes
+        cfg.rootfs_size_bytes / (1024 * 1024),
+        cfg.rootfs_size_bytes,
+        img_len.div_ceil(1024 * 1024),
     );
 
     report.stage("Switching storage to SD...");
