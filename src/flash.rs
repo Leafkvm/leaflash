@@ -198,27 +198,27 @@ pub struct FlashArgs {
     #[arg(short, long, value_parser = device::parse_device_addr)]
     pub device: Option<device::DeviceAddr>,
     /// Image file to write (raw, sector-aligned).
-    #[arg(long)]
+    #[arg(short, long)]
     pub image: PathBuf,
     /// Size of each rootfs partition. Optional when the card already
     /// has a leaflash GPT — in that case the size is read from the
     /// on-disk layout. Required for fresh cards / changing the size.
-    #[arg(long, value_parser = parse_size)]
+    #[arg(short = 's', long, value_parser = parse_size)]
     pub rootfs_size: Option<u64>,
     /// Reset the device after the image is written (boots into the new image).
-    #[arg(long, default_value_t = false)]
+    #[arg(short = 'r', long, default_value_t = false)]
     pub reset_after_flash: bool,
     /// Write LEAFKVMUSERDATAMAGIC at the start and end of the userdata
     /// partition. Bootloader treats this as a "first boot after flash"
     /// signal and wipes userdata automatically — without it, the
     /// bootloader asks the user to confirm before wiping.
-    #[arg(long, default_value_t = false)]
+    #[arg(short = 'm', long, default_value_t = false)]
     pub userdata_magic: bool,
     /// Target partition slot to write the image into. Defaults to
     /// whichever slot the on-disk GPT marks bootable; required when
     /// the card has no leaflash GPT or when neither slot is marked
     /// bootable.
-    #[arg(long, value_enum)]
+    #[arg(short = 'p', long, value_enum)]
     pub partition: Option<Partition>,
     /// Allow rewriting the on-disk GPT. Without this flag the flash
     /// only proceeds when the existing partition table already matches
