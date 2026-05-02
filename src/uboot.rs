@@ -5,7 +5,7 @@ use clap::Args;
 use indicatif::{ProgressBar, ProgressStyle};
 use rockusb::device::Device;
 use rockusb::libusb::Transport;
-use rockusb::protocol::StorageIndex;
+use rockusb::protocol::{ResetOpcode, StorageIndex};
 
 use crate::device;
 use crate::flash::SECTOR_SIZE;
@@ -27,6 +27,11 @@ pub struct UbootArgs {
     /// Must contain `env.img` plus the per-partition `.img` files.
     #[arg(short = 'a', long)]
     pub artifact_dir: PathBuf,
+    /// Skip the device reset that runs after a successful flash.
+    /// Default behaviour is to reset so the device reboots into the
+    /// freshly-written firmware.
+    #[arg(long)]
+    pub no_reset: bool,
 }
 
 struct Job {
@@ -60,7 +65,7 @@ pub fn run(args: UbootArgs) -> Result<()> {
         );
     }
 
-    flash_jobs(jobs)
+    flash_jobs(jobs, !args.no_reset)
 }
 
 fn find_env_img(root: &Path) -> Result<PathBuf> {
@@ -166,7 +171,7 @@ fn build_jobs(parts: &[mtdparts::Partition], dir: &Path, env_path: &Path) -> Res
     Ok(jobs)
 }
 
-fn flash_jobs(jobs: Vec<Job>) -> Result<()> {
+fn flash_jobs(jobs: Vec<Job>, reset_after: bool) -> Result<()> {
     let mut dev = device::open_single()?;
 
     println!("Switching storage to SPI NOR...");
@@ -232,7 +237,19 @@ fn flash_jobs(jobs: Vec<Job>) -> Result<()> {
         write_data(&mut dev, job.target_sector, &job.data, &job.name)?;
     }
 
-    println!("Done.");
+    if reset_after {
+        println!("Resetting device...");
+        // The reset itself yanks the USB endpoint, so rockusb often surfaces
+        // an error even though the reset succeeded. Don't let that fail the
+        // flash — surface it as a warning and exit cleanly.
+        if let Err(e) = dev.reset_device(ResetOpcode::Reset) {
+            eprintln!(
+                "Reset returned {e} (often expected — USB disconnects mid-call)",
+            );
+        }
+    }
+
+    println!("Done.{}", if reset_after { " Device reset." } else { "" });
     Ok(())
 }
 
