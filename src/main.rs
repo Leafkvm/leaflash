@@ -3,9 +3,10 @@ use clap::{Parser, Subcommand};
 
 mod device;
 mod flash;
-mod rkfw;
+mod mtdparts;
 mod tui;
 mod uboot;
+mod uboot_env;
 mod usb;
 
 #[derive(Parser)]

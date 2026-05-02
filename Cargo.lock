@@ -682,6 +682,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "clap",
+ "crc32fast",
  "crossterm",
  "fastrand",
  "gptman",
