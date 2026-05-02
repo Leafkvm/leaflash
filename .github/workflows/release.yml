@@ -36,6 +36,10 @@ jobs:
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             asset: leaflash-win-amd64.exe
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+            asset: leaflash-win-aarch64.exe
+            msvc_arch: arm64
     steps:
       - uses: actions/checkout@v4
 
@@ -77,6 +81,17 @@ jobs:
       - name: Install cargo-zigbuild
         if: matrix.use_zig
         run: cargo install --locked cargo-zigbuild
+
+      # ---------- Windows arm64: enable the MSVC arm64 cross toolchain ----------
+      # libusb1-sys's vendored build invokes cc, which auto-detects MSVC by
+      # walking PATH and the active VCINSTALLDIR. The default windows-latest
+      # environment activates the x64 host/x64 target tools; for arm64 we
+      # need to switch to the x64 host / arm64 target environment.
+      - name: Setup MSVC arm64 environment
+        if: matrix.msvc_arch
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.msvc_arch }}
 
       # ---------- Build ----------
       - name: Build (zigbuild)
