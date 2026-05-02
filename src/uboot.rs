@@ -54,8 +54,27 @@ pub fn run(args: UbootArgs) -> Result<()> {
     );
 
     // Erase only the sectors we're about to write (ceil(img_len / sector_size)).
+    //
+    // SPI NOR is slow per-sector and reports neither eMMC nor direct-LBA
+    // capability — issuing erase_lba with the eMMC-friendly 32K-sector
+    // chunk size makes the USB command time out, which leaves the device
+    // in a desynced state requiring a power-cycle. Mirror the picks
+    // rockusb-cli's erase_flash makes: direct_lba/eMMC → erase_lba @ 32K
+    // sectors, everything else → erase_force @ 1024 sectors.
+    const MAX_DIRECT_ERASE: u32 = 1024;
+    const MAX_LBA_ERASE: u32 = 32 * 1024;
+
+    let cap = dev.capability()?;
+    let id = dev.flash_id()?;
+    let is_emmc = id.to_str() == "EMMC ";
+    let is_lba = cap.direct_lba();
+    let max_blocks = if is_emmc || is_lba {
+        MAX_LBA_ERASE
+    } else {
+        MAX_DIRECT_ERASE
+    };
+
     let needed_sectors = img_len.div_ceil(SECTOR_SIZE) as u32;
-    let erase_chunk: u32 = 32 * 1024;
     let bar = ProgressBar::new(needed_sectors as u64);
     bar.set_style(
         ProgressStyle::with_template("Erasing SPI NOR... [{bar:40.cyan/blue}] {pos}/{len}")
@@ -64,8 +83,12 @@ pub fn run(args: UbootArgs) -> Result<()> {
     );
     let mut start = 0u32;
     while start < needed_sectors {
-        let count = erase_chunk.min(needed_sectors - start);
-        dev.erase_lba(start, count as u16)?;
+        let count = max_blocks.min(needed_sectors - start);
+        if is_emmc || is_lba {
+            dev.erase_lba(start, count as u16)?;
+        } else {
+            dev.erase_force(start, count as u16)?;
+        }
         start += count;
         bar.inc(count as u64);
     }
