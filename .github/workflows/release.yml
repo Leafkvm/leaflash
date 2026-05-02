@@ -39,7 +39,7 @@ jobs:
           - target: aarch64-pc-windows-msvc
             os: windows-latest
             asset: leaflash-win-aarch64.exe
-            msvc_arch: arm64
+            msvc_arch: amd64_arm64
     steps:
       - uses: actions/checkout@v4
 
