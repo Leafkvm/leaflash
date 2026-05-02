@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 
 mod device;
 mod flash;
+mod rkfw;
 mod tui;
 mod uboot;
 mod usb;
