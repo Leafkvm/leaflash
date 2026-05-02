@@ -97,6 +97,26 @@ pub struct Layout {
     pub user_end: u64,
 }
 
+impl Layout {
+    /// Size in bytes of one rootfs slot (A and B are the same size).
+    pub fn rootfs_size_bytes(&self) -> u64 {
+        (self.a_end - self.a_start + 1) * SECTOR_SIZE
+    }
+}
+
+/// Layout plus runtime info we read off the existing GPT — currently
+/// just which slot has the legacy-BIOS-bootable bit set, used to default
+/// the flash target to the slot the device is currently booting from.
+#[derive(Debug, Clone, Copy)]
+pub struct LayoutInfo {
+    pub layout: Layout,
+    /// `Some(A|B)` when exactly one of rootfs_a / rootfs_b has the
+    /// bootable bit set; `None` when the layout exists but the
+    /// bootable bit is missing or set on both — the caller has to
+    /// disambiguate explicitly.
+    pub active: Option<Partition>,
+}
+
 // gptman 1.x defaults: 128 partition entries (32 sectors), 1 MiB alignment.
 const GPT_ENTRIES_SECTORS: u64 = 32;
 const GPT_FIRST_USABLE_LBA: u64 = 2 + GPT_ENTRIES_SECTORS; // 34
@@ -129,6 +149,15 @@ pub fn read_existing_layout<R>(io: &mut R) -> Option<Layout>
 where
     R: std::io::Read + std::io::Seek,
 {
+    read_existing_layout_info(io).map(|li| li.layout)
+}
+
+/// Like `read_existing_layout` but also reports which rootfs slot the
+/// legacy-BIOS-bootable bit is set on.
+pub fn read_existing_layout_info<R>(io: &mut R) -> Option<LayoutInfo>
+where
+    R: std::io::Read + std::io::Seek,
+{
     let gpt = GPT::find_from(io).ok()?;
     let p1 = &gpt[1];
     let p2 = &gpt[2];
@@ -142,14 +171,23 @@ where
     {
         return None;
     }
-    Some(Layout {
+    let layout = Layout {
         a_start: p1.starting_lba,
         a_end: p1.ending_lba,
         b_start: p2.starting_lba,
         b_end: p2.ending_lba,
         user_start: p3.starting_lba,
         user_end: p3.ending_lba,
-    })
+    };
+    let a_boot = (p1.attribute_bits & ATTR_LEGACY_BIOS_BOOTABLE) != 0;
+    let b_boot = (p2.attribute_bits & ATTR_LEGACY_BIOS_BOOTABLE) != 0;
+    let active = match (a_boot, b_boot) {
+        (true, false) => Some(Partition::RootfsA),
+        (false, true) => Some(Partition::RootfsB),
+        // Both/neither bootable: ambiguous, callers must disambiguate.
+        _ => None,
+    };
+    Some(LayoutInfo { layout, active })
 }
 
 #[derive(Debug, Args, Clone)]
@@ -159,13 +197,15 @@ pub struct FlashArgs {
     /// than one is attached, this argument is required.
     #[arg(short, long, value_parser = device::parse_device_addr)]
     pub device: Option<device::DeviceAddr>,
-    /// Image file to write into rootfs_a (raw, sector-aligned)
+    /// Image file to write (raw, sector-aligned).
     #[arg(long)]
     pub image: PathBuf,
-    /// Size of each rootfs partition (A and B), e.g. "256MiB", "512M", "1GiB"
+    /// Size of each rootfs partition. Optional when the card already
+    /// has a leaflash GPT — in that case the size is read from the
+    /// on-disk layout. Required for fresh cards / changing the size.
     #[arg(long, value_parser = parse_size)]
-    pub rootfs_size: u64,
-    /// Reset the device after the image is written (boots into the new image)
+    pub rootfs_size: Option<u64>,
+    /// Reset the device after the image is written (boots into the new image).
     #[arg(long, default_value_t = false)]
     pub reset_after_flash: bool,
     /// Write LEAFKVMUSERDATAMAGIC at the start and end of the userdata
@@ -174,9 +214,19 @@ pub struct FlashArgs {
     /// bootloader asks the user to confirm before wiping.
     #[arg(long, default_value_t = false)]
     pub userdata_magic: bool,
-    /// Target partition slot to write the image into.
-    #[arg(long, value_enum, default_value_t = Partition::RootfsA)]
-    pub partition: Partition,
+    /// Target partition slot to write the image into. Defaults to
+    /// whichever slot the on-disk GPT marks bootable; required when
+    /// the card has no leaflash GPT or when neither slot is marked
+    /// bootable.
+    #[arg(long, value_enum)]
+    pub partition: Option<Partition>,
+    /// Allow rewriting the on-disk GPT. Without this flag the flash
+    /// only proceeds when the existing partition table already matches
+    /// what would be written (rootfs_a refresh in place, userdata
+    /// preserved). Required for fresh cards or whenever the rootfs
+    /// size changes — both cases destroy userdata.
+    #[arg(long, default_value_t = false)]
+    pub allow_partition: bool,
 }
 
 /// All inputs to `flash_image`. Add fields here instead of widening the
@@ -190,31 +240,91 @@ pub struct Config {
     pub target_partition: Partition,
 }
 
-impl From<&FlashArgs> for Config {
-    fn from(a: &FlashArgs) -> Self {
-        Self {
-            image: a.image.clone(),
-            rootfs_size_bytes: a.rootfs_size,
-            reset_after_flash: a.reset_after_flash,
-            userdata_magic: a.userdata_magic,
-            target_partition: a.partition,
-        }
-    }
-}
-
 pub fn run(args: FlashArgs) -> Result<()> {
+    // Probe the card up-front so we can default rootfs_size and the
+    // target partition from the existing GPT, and decide whether the
+    // operation needs --allow-partition.
+    let probe = probe_for_flash(args.device.as_ref())?;
+    let existing = probe.existing;
+
+    let rootfs_size_bytes = match args.rootfs_size {
+        Some(s) => s,
+        None => existing
+            .map(|li| li.layout.rootfs_size_bytes())
+            .ok_or_else(|| {
+                anyhow!(
+                    "no leaflash partition table on the SD card; \
+                     pass --rootfs-size <SIZE> --allow-partition to create one"
+                )
+            })?,
+    };
+
+    let target_partition = match args.partition {
+        Some(p) => p,
+        None => match existing {
+            Some(li) => li.active.ok_or_else(|| {
+                anyhow!(
+                    "existing GPT has no clear active slot \
+                     (rootfs_a/rootfs_b bootable bit is missing or set on both); \
+                     pass --partition rootfs_a|rootfs_b|both"
+                )
+            })?,
+            None => bail!(
+                "no leaflash partition table on the SD card; \
+                 pass --partition rootfs_a|rootfs_b|both"
+            ),
+        },
+    };
+
+    let expected = expected_layout(probe.total_sectors, rootfs_size_bytes)?;
+    let layout_matches = existing.map(|li| li.layout == expected).unwrap_or(false);
+    if !layout_matches && !args.allow_partition {
+        bail!(
+            "this flash would rewrite the SD card's partition table and erase userdata. \
+             Pass --allow-partition to proceed."
+        );
+    }
+
+    let cfg = Config {
+        image: args.image.clone(),
+        rootfs_size_bytes,
+        reset_after_flash: args.reset_after_flash,
+        userdata_magic: args.userdata_magic,
+        target_partition,
+    };
+
     let dev = match args.device {
         Some(addr) => device::open_at(addr.bus, addr.address)?,
         None => device::open_single()?,
     };
     let report = ProgressReporter::Cli;
-    let cfg = Config::from(&args);
     flash_image(dev, &cfg, &report)?;
     println!(
         "Done.{}",
         if cfg.reset_after_flash { " Device reset." } else { "" }
     );
     Ok(())
+}
+
+struct FlashProbe {
+    total_sectors: u64,
+    existing: Option<LayoutInfo>,
+}
+
+fn probe_for_flash(addr: Option<&device::DeviceAddr>) -> Result<FlashProbe> {
+    let mut dev = match addr {
+        Some(a) => device::open_at(a.bus, a.address)?,
+        None => device::open_single()?,
+    };
+    dev.switch_storage(StorageIndex::Sd)?;
+    let info = dev.flash_info()?;
+    let total_sectors = info.sectors() as u64;
+    let mut io = dev.into_io()?;
+    let existing = read_existing_layout_info(&mut io);
+    Ok(FlashProbe {
+        total_sectors,
+        existing,
+    })
 }
 
 /// Parse human-readable sizes like "256MiB", "512M", "1GiB". Returns bytes.

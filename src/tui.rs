@@ -44,7 +44,7 @@ struct App {
     selected_device: usize,
     sd_total_sectors: Option<u64>,
     sd_total_bytes: Option<u64>,
-    sd_existing: Option<flash::Layout>,
+    sd_existing: Option<flash::LayoutInfo>,
     flash_result: Arc<Mutex<Option<Result<(), String>>>>,
     success_banner: bool,
     reset_after_flash: bool,
@@ -382,7 +382,7 @@ fn open_confirmation(app: &mut App) -> Result<()> {
         (Some(total_sectors), Some(existing)) => {
             flash::expected_layout(total_sectors, size_bytes)
                 .ok()
-                .map(|exp| exp == existing)
+                .map(|exp| exp == existing.layout)
                 .unwrap_or(false)
         }
         _ => false,
@@ -485,15 +485,29 @@ fn reprobe_selected(app: &mut App) {
             app.sd_total_bytes = Some(p.total_bytes);
             app.sd_total_sectors = Some(p.total_sectors);
             app.sd_existing = p.existing;
+            // Default the flash target to whichever slot is currently
+            // marked bootable on the card. The user can still cycle
+            // it with 'p' before confirming.
+            if let Some(li) = p.existing {
+                if let Some(active) = li.active {
+                    app.target_partition = active;
+                }
+                // Also seed the rootfs-size box from the on-disk layout so
+                // the user doesn't have to retype it for an in-place flash.
+                let mib = li.layout.rootfs_size_bytes() / (1024 * 1024);
+                if mib > 0 {
+                    app.size_input = format!("{mib}MiB");
+                }
+            }
             app.log.lock().unwrap().push(format!(
                 "Probed device {}:{}: SD {} MiB{}",
                 d.bus,
                 d.address,
                 p.total_bytes / (1024 * 1024),
-                if p.existing.is_some() {
-                    " (existing leaflash GPT)"
-                } else {
-                    ""
+                match p.existing.and_then(|li| li.active) {
+                    Some(active) => format!(" (existing leaflash GPT, active = {active})"),
+                    None if p.existing.is_some() => " (existing leaflash GPT)".to_string(),
+                    _ => "".to_string(),
                 },
             ));
         }
@@ -792,7 +806,28 @@ fn draw_confirm_overlay(f: &mut ratatui::Frame<'_>, app: &App, pc: &PendingConfi
     if let Ok(meta) = std::fs::metadata(&cfg.image) {
         push(&mut lines, "image size", format!("{} MiB ({} bytes)", meta.len() / mib, meta.len()));
     }
-    push(&mut lines, "target partition", cfg.target_partition.to_string());
+    {
+        let detected_active = app.sd_existing.and_then(|li| li.active);
+        let is_active_match =
+            detected_active.map(|a| a == cfg.target_partition).unwrap_or(false);
+        let value = if is_active_match {
+            Span::styled(
+                format!("{} (active)", cfg.target_partition),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::raw(cfg.target_partition.to_string())
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {:<22}", "target partition"),
+                Style::default().fg(Color::DarkGray),
+            ),
+            value,
+        ]));
+    }
     push(&mut lines, "rootfs A size", format!("{} MiB", cfg.rootfs_size_bytes / mib));
     push(&mut lines, "rootfs B size", format!("{} MiB", cfg.rootfs_size_bytes / mib));
     let userdata_estimate = app.sd_total_bytes.map(|t| {

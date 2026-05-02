@@ -83,7 +83,7 @@ fn probe_with(mut device: Device<Transport>) -> Result<SdProbe> {
     let total_bytes = info.size();
     let total_sectors = info.sectors() as u64;
     let mut io = device.into_io()?;
-    let existing = crate::flash::read_existing_layout(&mut io);
+    let existing = crate::flash::read_existing_layout_info(&mut io);
     Ok(SdProbe {
         total_bytes,
         total_sectors,
@@ -95,7 +95,7 @@ fn probe_with(mut device: Device<Transport>) -> Result<SdProbe> {
 pub struct SdProbe {
     pub total_bytes: u64,
     pub total_sectors: u64,
-    pub existing: Option<crate::flash::Layout>,
+    pub existing: Option<crate::flash::LayoutInfo>,
 }
 
 /// USB bus + device address, used by CLI subcommands that target a
