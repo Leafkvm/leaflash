@@ -211,10 +211,7 @@ fn handle_event(app: &mut App, evt: &Event) -> Result<Tick> {
             return Ok(Tick::Continue);
         }
         KeyCode::Char('p') if app.focus != Focus::Size => {
-            app.target_partition = match app.target_partition {
-                Partition::RootfsA => Partition::RootfsB,
-                Partition::RootfsB => Partition::RootfsA,
-            };
+            app.target_partition = next_partition(app.target_partition);
             return Ok(Tick::Continue);
         }
         KeyCode::Char('r') if app.focus != Focus::Size => {
@@ -287,10 +284,7 @@ fn handle_confirm_key(app: &mut App, key: &crossterm::event::KeyEvent) -> Result
             }
         }
         KeyCode::Char('p') | KeyCode::Char('P') => {
-            app.target_partition = match app.target_partition {
-                Partition::RootfsA => Partition::RootfsB,
-                Partition::RootfsB => Partition::RootfsA,
-            };
+            app.target_partition = next_partition(app.target_partition);
             if let Some(pc) = app.pending_confirm.as_mut() {
                 pc.cfg.target_partition = app.target_partition;
             }
@@ -447,6 +441,15 @@ fn kickoff_flash(app: &mut App, cfg: Config) {
 
 /// Re-list RockUSB devices and re-probe the SD on whichever one is now
 /// selected. Bound to `r` at the top level.
+/// Cycle order for the 'p' toggle: A → B → Both → A.
+fn next_partition(p: Partition) -> Partition {
+    match p {
+        Partition::RootfsA => Partition::RootfsB,
+        Partition::RootfsB => Partition::Both,
+        Partition::Both => Partition::RootfsA,
+    }
+}
+
 fn refresh_devices(app: &mut App) {
     match device::list() {
         Ok(d) => {
@@ -837,15 +840,13 @@ fn draw_confirm_overlay(f: &mut ratatui::Frame<'_>, app: &App, pc: &PendingConfi
     //   either way.
     lines.push(Line::from(""));
     if pc.layout_matches {
-        let other = match cfg.target_partition {
-            Partition::RootfsA => "rootfs_b",
-            Partition::RootfsB => "rootfs_a",
+        let msg = match cfg.target_partition {
+            Partition::RootfsA => "Existing GPT matches: only rootfs_a will be erased + rewritten; rootfs_b and userdata preserved.".to_string(),
+            Partition::RootfsB => "Existing GPT matches: only rootfs_b will be erased + rewritten; rootfs_a and userdata preserved.".to_string(),
+            Partition::Both => "Existing GPT matches: rootfs_a and rootfs_b will be erased + rewritten; userdata preserved.".to_string(),
         };
         lines.push(Line::from(Span::styled(
-            format!(
-                "Existing GPT matches: only {} will be erased + rewritten; {} and userdata preserved.",
-                cfg.target_partition, other,
-            ),
+            msg,
             Style::default().fg(Color::Green),
         )));
     } else {
