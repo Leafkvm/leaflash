@@ -6,7 +6,6 @@ Development CLI for the [LeafKVM](https://www.crowdsupply.com/leafkvm/leafkvm) d
 
 ```text
 leaflash flash -i image.img             # SD card; in-place A/B-aware refresh
-leaflash uboot -a output/                # SPI NOR; from spi-flash-img-builder output
 leaflash tui                             # interactive
 leaflash usb <subcommand>                # nested rockusb-cli
 ```
