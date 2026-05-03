@@ -22,13 +22,13 @@ enum Top {
     #[command(alias = "f", alias = "sd")]
     Flash(flash::FlashArgs),
     /// Write a u-boot / SPI-NOR image to the device's SPI NOR
-    #[command(alias = "ub", alias = "spi")]
+    #[command(alias = "u", alias = "spi")]
     Uboot(uboot::UbootArgs),
     /// Interactive TUI for selecting an image and flashing
     #[command(alias = "t")]
     Tui,
     /// Low-level rockusb operations (reused from rockusb-cli)
-    #[command(alias = "us")]
+    #[command(alias = "rk")]
     Usb(usb::UsbArgs),
 }
 

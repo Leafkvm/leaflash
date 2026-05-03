@@ -51,27 +51,6 @@ Other flags:
 | `-p, --partition <rootfs_a\|rootfs_b\|both>` | target slot(s) |
 | `--allow-partition` | required guard for any flash that rewrites the GPT |
 
-### `uboot` (alias `ub`, `spi`) — write to SPI NOR
-
-```sh
-leaflash uboot -a output/           # default: reset device after flash
-leaflash uboot -a output/ --no-reset
-```
-
-`-a, --artifact-dir` points at a build directory like the one produced
-by [`spi-flash-img-builder`](https://github.com/Leafkvm/spi-flash-img-builder).
-We walk it for `env.img`, parse the U-Boot environment per
-[`mkenvimage.c`](https://github.com/u-boot/u-boot/blob/master/tools/mkenvimage.c)
-(CRC32 validated, both endiannesses accepted), read its `mtdparts=`
-string, parse it with kernel `cmdlinepart.c` semantics, and write each
-declared partition's `<name>.img` sibling at the offset `mtdparts`
-assigns it. Erase is capability-aware: `erase_force` at 1024-sector
-chunks for SPI NOR, `erase_lba` at 32K-sector chunks for eMMC /
-direct-LBA storages.
-
-There is **no support for the proprietary `update.img` / RKFW
-container** — only documented public formats (U-Boot env, mtdparts).
-
 ### `tui` (alias `t`) — interactive TUI
 
 Multi-device aware (`r` refreshes, `1`-`9` selects when more than one
@@ -88,7 +67,7 @@ Keys (top-level): `Tab` cycles focus, `q`/`Esc`/`Ctrl-C` quits,
 reboot-after-flash, `m` toggles userdata-magic, `p` toggles target
 partition (`A → B → Both → A`).
 
-### `usb` (alias `us`) — low-level rockusb
+### `usb` (alias `rk`) — low-level rockusb
 
 Nested verbatim from
 [`rockusb-cli`](https://github.com/wtdcode/rockchiprs/tree/dev/rockusb-cli):
