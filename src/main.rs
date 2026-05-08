@@ -4,6 +4,7 @@ use clap::{Parser, Subcommand};
 mod device;
 mod flash;
 mod mtdparts;
+mod switch_rootfs;
 mod tui;
 mod uboot;
 mod uboot_env;
@@ -30,6 +31,9 @@ enum Top {
     /// Low-level rockusb operations (reused from rockusb-cli)
     #[command(alias = "rk")]
     Usb(usb::UsbArgs),
+    /// Switch the bootable rootfs slot (rootfs_a <-> rootfs_b) on the SD card
+    #[command(alias = "sw", alias = "switch")]
+    SwitchRootfs(switch_rootfs::SwitchRootfsArgs),
 }
 
 fn main() -> Result<()> {
@@ -39,5 +43,6 @@ fn main() -> Result<()> {
         Top::Uboot(args) => uboot::run(args),
         Top::Tui => tui::run(),
         Top::Usb(args) => usb::run(args),
+        Top::SwitchRootfs(args) => switch_rootfs::run(args),
     }
 }

@@ -8,9 +8,10 @@ Development CLI for the [LeafKVM](https://www.crowdsupply.com/leafkvm/leafkvm) d
 leaflash flash -i image.img             # SD card; in-place A/B-aware refresh
 leaflash tui                             # interactive
 leaflash usb <subcommand>                # nested rockusb-cli
+leaflash switch-rootfs                  # flip the bootable A/B slot
 ```
 
-Every subcommand also has short aliases: `f`/`sd`, `ub`/`spi`, `t`, `us`.
+Every subcommand also has short aliases: `f`/`sd`, `ub`/`spi`, `t`, `us`, `sw`/`switch`.
 
 ## Subcommands
 
@@ -65,6 +66,20 @@ Keys (top-level): `Tab` cycles focus, `q`/`Esc`/`Ctrl-C` quits,
 `r` refreshes devices, `1`-`9` selects a device, `b` toggles
 reboot-after-flash, `m` toggles userdata-magic, `p` toggles target
 partition (`A → B → Both → A`).
+
+### `switch-rootfs` (alias `sw`, `switch`) — flip the active slot
+
+Toggles the `LegacyBIOSBootable` attribute between `rootfs_a` and
+`rootfs_b` on the SD card's GPT, so the next boot uses the other slot.
+With no `--partition`, it switches to whichever slot is currently
+inactive; if neither slot is marked active it warns and picks
+`rootfs_a`.
+
+```sh
+leaflash switch-rootfs                # flip to the inactive slot
+leaflash switch-rootfs -p rootfs_b    # explicitly target rootfs_b
+leaflash switch-rootfs -d 1:5         # pick a specific RockUSB device
+```
 
 ### `usb` (alias `rk`) — low-level rockusb
 
