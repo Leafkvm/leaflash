@@ -1,5 +1,8 @@
 # leaflash
 
+> [!IMPORTANT]
+> Though the repository heavily relies on LLM for coding, we ensure that each functionality have been extensively tested on our real devices, including various edge cases and our team members are dogfooding the tool as well. 
+
 ![leaflash](./leaflash-main.png)
 
 Development CLI for the [LeafKVM](https://www.crowdsupply.com/leafkvm/leafkvm) device.
